@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 临时文件与测试产物
+asar/
+mountapp/.quarkclouddrive/
+*.log
+tmp/
+temp/
+
+# 敏感信息（绝对不能提交）
+proxy_state.json
+config.json
+*.pem
+*.key
+*.cert
+*password*
+*secret*
+*credential*
+
+# 构建产物（可从源码重新构建）
+小米智能存储挂载助手.app/
