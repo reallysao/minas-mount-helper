@@ -40,12 +40,12 @@
 
 ### 方式一：直接下载（推荐）
 
-从 [GitHub Releases](https://github.com/your-username/minas-mount-helper/releases) 下载最新版 `.app`，拖入 `/Applications/`。
+从 [GitHub Releases](https://github.com/reallysao/minas-mount-helper/releases) 下载最新版 `.app`，拖入 `/Applications/`。
 
 ### 方式二：从源码构建
 
 ```bash
-git clone https://github.com/your-username/minas-mount-helper.git
+git clone https://github.com/reallysao/minas-mount-helper.git
 cd minas-mount-helper/mountapp
 
 # 编译 netfs_mount（需要 Xcode Command Line Tools）
