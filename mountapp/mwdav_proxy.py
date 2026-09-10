@@ -250,6 +250,30 @@ def _send_upstream(method, path, headers, body):
     # 注入认证
     creds = f'{up["username"]}:{up["password"]}'
     out_headers["Authorization"] = "Basic " + base64.b64encode(creds.encode()).decode()
+
+    # 转换 Destination 头（MOVE/COPY 请求）：把本地代理地址替换成上游地址 + base
+    # Finder 发的 Destination 是 http://127.0.0.1:18445/路径/，NAS 期望 https://上游:端口/pool0/data/路径/
+    # 不转换的话 NAS 返回 400，导致 Finder 提示"请尝试使用字符较少，或不含标点符号的名称"
+    dest_key = None
+    for k in out_headers:
+        if k.lower() == "destination":
+            dest_key = k
+            break
+    if dest_key:
+        dest = out_headers[dest_key]
+        try:
+            parsed = urllib.parse.urlparse(dest)
+            # 重新构造上游 URL：https://host:port + base + path
+            upstream_dest = f"https://{up['host']}:{up['port']}{up['base']}{parsed.path}"
+            if parsed.query:
+                upstream_dest += "?" + parsed.query
+            if parsed.fragment:
+                upstream_dest += "#" + parsed.fragment
+            del out_headers[dest_key]
+            out_headers["Destination"] = upstream_dest
+        except Exception:
+            pass
+
     # 路径：代理根路径 -> 上游 base
     if path == "/" or path == "":
         full = up["base"] + "/"
