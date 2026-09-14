@@ -1,0 +1,11 @@
+# 本地生成的自签名证书和私钥（不应公开）
+localhost.crt
+localhost.key
+
+# 编译临时文件
+*.o
+netfs_mount_old
+
+# Python 缓存
+__pycache__/
+*.pyc

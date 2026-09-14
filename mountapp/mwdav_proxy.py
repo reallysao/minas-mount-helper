@@ -406,7 +406,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        pass  # 静默日志
+        # 记录请求日志，用于调试
+        try:
+            print(f"[PROXY] {self.address_string()} - {fmt % args}", flush=True)
+        except Exception:
+            pass
 
     def _send_simple(self, status, body=b"", content_type="text/plain; charset=utf-8"):
         """快速发送简单响应（用于元数据 404、错误等）"""
@@ -429,11 +433,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (OSError, ValueError, ConnectionError):
             body = None
 
-        # 2. 入站认证
-        if not _check_incoming_auth(self.headers):
-            self._send_simple(401, b"Authentication required")
-            self.send_header("WWW-Authenticate", 'Basic realm="MiNAS"')
-            return
+        # 2. 入站认证已移除：代理只监听 127.0.0.1，仅本机可访问；
+        #    状态文件 600 权限仅当前用户可读；上游连接使用客户端证书认证。
+        #    macOS 新版 NetFS 不再自动传递 Basic 凭证，保留认证会导致挂载失败。
 
         # 3. Finder 元数据请求快速响应（不转发上游，直接 404）
         #    这是大目录性能提升的关键：Finder 对每个文件请求 ._文件名 等，
@@ -481,9 +483,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 8. 回传响应
             self.send_response(status)
             for k, v in hdrs.items():
-                if k.lower() in ("content-length", "transfer-encoding", "connection"):
+                # 跳过 Python 已自动添加的头，以及需要特殊处理的头
+                if k.lower() in ("content-length", "transfer-encoding", "connection", "server", "date"):
                     continue
                 self.send_header(k, v)
+            # OPTIONS 响应添加 WWW-Authenticate 头，告诉客户端需要 Basic 认证
+            if self.command == "OPTIONS":
+                self.send_header("WWW-Authenticate", 'Basic realm="MiNAS"')
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             if self.command != "HEAD":
@@ -514,14 +520,37 @@ class ProxyServer:
     def __init__(self, port=DEFAULT_LISTEN_PORT):
         self.port = port
         self.httpd = None
+        self.httpsd = None
         self.thread = None
+        self.https_thread = None
+        self._https = False
 
     def start(self):
         # 设置 TCP keepalive 和 backlog，改善高并发下的连接处理
         http.server.ThreadingHTTPServer.request_queue_size = 64
+
+        # HTTP 服务器（主端口，用于 Finder 挂载）
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
+
+        # HTTPS 服务器（主端口+1，可选，用于需要加密的场景）
+        cert_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "localhost.crt")
+        key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "localhost.key")
+        if os.path.exists(cert_file) and os.path.exists(key_file):
+            try:
+                https_port = self.port + 1
+                self.httpsd = http.server.ThreadingHTTPServer(("127.0.0.1", https_port), Handler)
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                self.httpsd.socket = ctx.wrap_socket(self.httpsd.socket, server_side=True)
+                self.https_thread = threading.Thread(target=self.httpsd.serve_forever, daemon=True)
+                self.https_thread.start()
+                self._https = True
+            except Exception as e:
+                print(f"HTTPS 启用失败: {e}")
+                self._https = False
+
         return True
 
     def stop(self):
@@ -529,6 +558,10 @@ class ProxyServer:
             self.httpd.shutdown()
             self.httpd.server_close()
             self.httpd = None
+        if self.httpsd:
+            self.httpsd.shutdown()
+            self.httpsd.server_close()
+            self.httpsd = None
 
     def is_running(self):
         return self.httpd is not None
@@ -553,6 +586,8 @@ if __name__ == "__main__":
     srv = ProxyServer(args.port)
     srv.start()
     print(f"代理已启动(v2优化版): http://127.0.0.1:{args.port}  ->  https://127.0.0.1:{args.upstream}{UPSTREAM_BASE}")
+    if srv._https:
+        print(f"  HTTPS 可选端口: https://127.0.0.1:{args.port + 1}")
     print(f"  连接复用: 每线程持久连接 | 并发限制: {MAX_CONCURRENT_UPSTREAM} | 超时: {UPSTREAM_TIMEOUT}s | PROPFIND缓存: {PROPFIND_CACHE_TTL}s")
     try:
         while True:
