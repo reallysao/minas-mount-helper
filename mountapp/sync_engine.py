@@ -71,7 +71,8 @@ class SyncPlan:
         self.source = kw.get("source", "")
         # dest_rel: 相对 NAS 根目录的路径，如 "我的文档/Mac同步/桌面"
         self.dest_rel = kw.get("dest_rel", "")
-        self.mode = kw.get("mode", "mirror")      # mirror / backup
+        self.mode = kw.get("mode", "mirror")      # mirror（镜像，本地删 NAS 也删）/ backup（只传不删）
+        self.delete_after = bool(kw.get("delete_after", False))  # 同步完成后删除本机已同步文件（仅 backup 生效）
         self.schedule = kw.get("schedule", "manual")  # manual / interval / watch
         self.interval_min = int(kw.get("interval_min", 60) or 60)
         self.enabled = bool(kw.get("enabled", True))
@@ -83,6 +84,7 @@ class SyncPlan:
         return {
             "id": self.id, "name": self.name, "source": self.source,
             "dest_rel": self.dest_rel, "mode": self.mode,
+            "delete_after": self.delete_after,
             "schedule": self.schedule, "interval_min": self.interval_min,
             "enabled": self.enabled, "last_run": self.last_run,
             "last_status": self.last_status,
@@ -262,6 +264,16 @@ class SyncEngine:
             notify("小米 NAS 同步失败", f"{plan.name}: {msg}")
             return
 
+        # 2.5 iCloud 文件物化：源文件可能在 iCloud 上未下载到本地（占位符），
+        #     直接同步会传 0 字节占位文件导致内容丢失。先强制下载到本地。
+        self._set_progress(pid, status="检查 iCloud 文件…", total=0, done=0)
+        ok, msg = self.ensure_icloud_materialized(src)
+        if not ok:
+            self._set_progress(pid, status=msg, total=0, done=0)
+            plan.last_status = msg
+            notify("小米 NAS 同步失败", f"{plan.name}: {msg}")
+            return
+
         # 3. 目标目录
         try:
             os.makedirs(dest, exist_ok=True)
@@ -328,14 +340,57 @@ class SyncEngine:
             self._set_progress(pid, status="同步失败", total=total, done=done)
             notify("小米 NAS 同步失败", f"{plan.name}：同步失败，已传 {done} 项")
 
+    # ---------- iCloud 物化 ----------
+    def ensure_icloud_materialized(self, src):
+        """确保 iCloud 文件已下载到本地（st_blocks>0），否则同步的是占位符会丢内容。
+        返回 (ok, msg)。仅源目录位于 iCloud 云盘时处理；本地文件直接通过。"""
+        try:
+            real = os.path.realpath(src)
+            if "Mobile Documents" not in real and "com~apple~CloudDocs" not in real:
+                return True, ""
+            # 收集未物化文件（dataless 文件 st_blocks == 0）
+            pending = []
+            for root, _dirs, files in os.walk(real):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    try:
+                        st = os.stat(fp)
+                        if st.st_blocks == 0 and not os.path.islink(fp):
+                            pending.append(fp)
+                    except Exception:
+                        pass
+            if not pending:
+                return True, ""
+            # 触发 iCloud 下载（对目录递归）
+            try:
+                subprocess.run(["brctl", "download", real],
+                               capture_output=True, timeout=120)
+            except Exception:
+                pass
+            # 等待物化完成（最长 5 分钟）
+            waited = 0
+            while pending and waited < 300:
+                time.sleep(5)
+                waited += 5
+                pending = [fp for fp in pending
+                           if os.path.exists(fp) and os.stat(fp).st_blocks == 0]
+            if pending:
+                return False, ("有 %d 个 iCloud 文件未能下载到本地（可能是云端未同步或网络问题），"
+                               "为避免同步到占位符导致内容丢失，已中止。请先在 Finder 中打开这些文件") % len(pending)
+            return True, ""
+        except Exception as e:
+            return True, ""  # 物化失败不阻塞同步（尽力而为），但记录
+
     # ---------- rsync 构建 ----------
     def _build_rsync(self, plan, dry=False):
         cmd = ["rsync", "-a", "--partial", "-i"]
         if dry:
             cmd.append("--dry-run")
         if plan.mode == "mirror":
+            # 镜像：本地删除 → NAS 同步删除（delete_after 与镜像冲突，忽略）
             cmd.append("--delete")
-        elif plan.mode == "backup":
+        elif plan.delete_after:
+            # 备份 + 传完删除本机源文件
             cmd.append("--remove-source-files")
         for ex in DEFAULT_EXCLUDES:
             cmd.append("--exclude=%s" % ex)

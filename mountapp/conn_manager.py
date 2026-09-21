@@ -80,6 +80,34 @@ def _make_ctx(cert_files):
     return ctx
 
 
+PROXY_STATE = os.path.expanduser(
+    "~/Library/Application Support/小米智能存储挂载助手/proxy_state.json")
+PROXY_PORT = 18445
+
+
+def _proxy_alive():
+    """本地挂载代理是否在运行（lsof 探测 18445 端口）"""
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", "-iTCP:%d" % PROXY_PORT, "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=4)
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def read_proxy_state():
+    """从挂载代理状态文件恢复凭证与上游端口（代理运行中即凭证有效）"""
+    try:
+        with open(PROXY_STATE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("username") and d.get("password") and d.get("port"):
+            return d.get("username"), d.get("password"), int(d.get("port"))
+    except Exception:
+        pass
+    return None, None, None
+
+
 def find_sso_login_pid():
     """找到官方 App 的原生隧道进程"""
     out = _run(["pgrep", "-f", "sso_login"])
@@ -336,6 +364,18 @@ class ConnManager:
         # ---- 快路径 ----
         pid = find_sso_login_pid()
         if not pid:
+            # 兜底：本地挂载代理仍在运行（已建立 Finder 挂载）→ 视为在线，
+            # 隧道与凭证由代理维护，不必因为 sso_login 进程名变化而误报离线
+            if _proxy_alive():
+                user, pwd, wd_port = read_proxy_state()
+                if user and pwd and wd_port:
+                    st["connected"] = True
+                    st["mode"] = "p2p"
+                    st["username"] = user
+                    st["password"] = pwd
+                    st["webdav_port"] = wd_port
+                    st["error"] = ""
+                    return st
             st["connected"] = False
             st["mode"] = ""
             st["luci_port"] = st["webdav_port"] = None
@@ -352,6 +392,12 @@ class ConnManager:
 
         # 凭证：官方 App 缓存（秒级、稳定）
         user, pwd = read_webdav_from_leveldb()
+        if not (user and pwd):
+            # 兜底：LevelDB 缓存读取失败（官方 App 更新/缓存清理），
+            # 但代理进程正在运行 → 用代理状态文件里的凭证
+            u2, p2, _w2 = read_proxy_state()
+            if u2 and p2 and _proxy_alive():
+                user, pwd = u2, p2
         if user and pwd:
             st["username"] = user
             st["password"] = pwd

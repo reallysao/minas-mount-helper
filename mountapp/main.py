@@ -36,6 +36,7 @@ class PlanDialog(tk.Toplevel):
         self.title("编辑同步计划" if plan else "添加同步计划")
         self.configure(bg=BG)
         self.resizable(False, False)
+        self.geometry("500x640")
         self.font = master.font
         self.font_small = master.font_small
         self.font_bold = master.font_bold
@@ -82,6 +83,11 @@ class PlanDialog(tk.Toplevel):
         tk.Button(srow, text="浏览…", font=self.font_small, bg="#e5e5ea", fg=TEXT,
                   relief="flat", bd=0, padx=10, pady=3, activebackground="#d1d1d6",
                   command=self._browse_src).pack(side="left", padx=(6, 0))
+        # iCloud 提示
+        self.icloud_hint = tk.Label(f, text="", font=("PingFang SC", 9), bg=CARD,
+                                    fg="#b25000", wraplength=460, justify="left")
+        self.icloud_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.src_var.trace_add("write", self._src_changed)
 
         # 目标位置（相对 NAS）
         box = self._row(f, "同步到（NAS）")
@@ -112,38 +118,59 @@ class PlanDialog(tk.Toplevel):
             rest = ""
         self.dest_sub_var = tk.StringVar(value=rest)
         self.dest_entry.configure(textvariable=self.dest_sub_var)
-        tk.Label(box, text="子文件夹（留空则直接放根目录）", font=("PingFang SC", 9),
+        tk.Label(box, text="子文件夹（留空则直接放所选目录）", font=("PingFang SC", 9),
                  bg=CARD, fg=SUBTEXT).pack(anchor="w", pady=(4, 0))
 
         # 模式
         box = self._row(f, "同步模式")
         self.mode_var = tk.StringVar(value=p.mode if p else "mirror")
-        for val, txt in (("mirror", "镜像（本机删除 → NAS 同步删除）"),
-                         ("backup", "备份（传完删除本机已备份文件）")):
+        for val, txt in (("mirror", "镜像：本机删除 → NAS 同步删除（保持两边一致）"),
+                         ("backup", "备份：只传到 NAS，不动本机文件")):
             tk.Radiobutton(box, text=txt, value=val, variable=self.mode_var,
                            font=("PingFang SC", 10), bg=CARD, fg=TEXT,
                            activebackground=CARD, selectcolor=CARD,
                            anchor="w").pack(anchor="w")
+        self.mode_var.trace_add("write", self._mode_changed)
 
-        # 调度
+        # 同步完成后是否删除本机文件
+        box = self._row(f, "同步完成后")
+        self.del_after_var = tk.BooleanVar(value=bool(p.delete_after if p else False))
+        self.del_after_cb = tk.Checkbutton(
+            box, text="删除本机已同步的文件（释放磁盘空间）", variable=self.del_after_var,
+            font=("PingFang SC", 10), bg=CARD, fg=TEXT,
+            activebackground=CARD, selectcolor=CARD, anchor="w")
+        self.del_after_cb.pack(anchor="w")
+        tk.Label(box, text="仅在「备份」模式下可用；勾选后同步完成会删除本地已传文件，NAS 保留副本",
+                 font=("PingFang SC", 9), bg=CARD, fg=SUBTEXT, wraplength=380,
+                 justify="left").pack(anchor="w", pady=(2, 0))
+        self._mode_changed()
+
+        # 触发方式（间隔紧跟在“定时”后面）
         box = self._row(f, "触发方式")
         self.sched_var = tk.StringVar(value=p.schedule if p else "manual")
-        for val, txt in (("manual", "手动（点击“立即同步”）"),
-                         ("interval", "定时（每隔指定分钟）"),
-                         ("watch", "文件变化（源文件夹内容变化时）")):
-            tk.Radiobutton(box, text=txt, value=val, variable=self.sched_var,
+        self.interval_var = tk.StringVar(value=str(p.interval_min if p else 60))
+
+        def _sched_row(val, txt, with_interval=False):
+            row = tk.Frame(box, bg=CARD)
+            row.pack(fill="x", anchor="w")
+            tk.Radiobutton(row, text=txt, value=val, variable=self.sched_var,
                            font=("PingFang SC", 10), bg=CARD, fg=TEXT,
                            activebackground=CARD, selectcolor=CARD,
-                           anchor="w").pack(anchor="w")
-        icol = tk.Frame(box, bg=CARD)
-        icol.pack(anchor="w", pady=(6, 0))
-        tk.Label(icol, text="间隔（分钟）", font=("PingFang SC", 10), bg=CARD,
-                 fg=SUBTEXT).pack(side="left")
-        self.interval_var = tk.StringVar(value=str(p.interval_min if p else 60))
-        tk.Spinbox(icol, from_=1, to=10080, textvariable=self.interval_var,
-                   width=6, font=self.font_small, relief="flat",
-                   highlightthickness=1, highlightbackground="#d1d1d6").pack(
-                       side="left", padx=(8, 0))
+                           anchor="w").pack(side="left")
+            if with_interval:
+                tk.Label(row, text="每隔", font=("PingFang SC", 10), bg=CARD,
+                         fg=SUBTEXT).pack(side="left", padx=(10, 0))
+                tk.Spinbox(row, from_=1, to=10080, textvariable=self.interval_var,
+                           width=5, font=self.font_small, relief="flat",
+                           highlightthickness=1, highlightbackground="#d1d1d6"
+                           ).pack(side="left", padx=(6, 0))
+                tk.Label(row, text="分钟", font=("PingFang SC", 10), bg=CARD,
+                         fg=SUBTEXT).pack(side="left", padx=(6, 0))
+            return row
+
+        _sched_row("manual", "手动（点击“立即同步”）")
+        _sched_row("interval", "定时", with_interval=True)
+        _sched_row("watch", "文件变化（源文件夹内容变化时自动同步）")
 
         # 按钮
         btns = tk.Frame(self, bg=BG)
@@ -161,6 +188,24 @@ class PlanDialog(tk.Toplevel):
         if d:
             self.src_var.set(d)
 
+    def _src_changed(self, *_):
+        src = self.src_var.get()
+        real = os.path.realpath(src) if os.path.exists(src) else src
+        if "Mobile Documents" in real or "com~apple~CloudDocs" in real:
+            self.icloud_hint.config(
+                text="⚠ 源文件夹在 iCloud 云盘中：同步前会自动把云端文件下载到本地再上传，"
+                     "避免同步占位符导致内容丢失。若勾选“删除本机已同步的文件”，iCloud 云端副本也会被删除！")
+        else:
+            self.icloud_hint.config(text="")
+
+    def _mode_changed(self, *_):
+        # 镜像模式与“删除本机文件”冲突（镜像会反向删除），禁用
+        if self.mode_var.get() == "mirror":
+            self.del_after_cb.config(state="disabled")
+            self.del_after_var.set(False)
+        else:
+            self.del_after_cb.config(state="normal")
+
     def _dest_changed(self, _=None):
         if self.dest_var.get() == "自定义…":
             self.dest_entry.pack(side="left", fill="x", expand=True)
@@ -169,26 +214,42 @@ class PlanDialog(tk.Toplevel):
             self.dest_entry.pack_forget()
 
     def _save(self):
-        name = self.name_var.get().strip()
-        src = self.src_var.get().strip()
-        if not name or not src:
-            return
-        base = self.dest_var.get()
-        sub = self.dest_sub_var.get().strip().strip("/")
-        if base == "自定义…":
-            dest_rel = sub
-        else:
-            dest_rel = "/".join(x for x in (base, sub) if x)
-        data = dict(
-            name=name, source=os.path.expanduser(src), dest_rel=dest_rel,
-            mode=self.mode_var.get(), schedule=self.sched_var.get(),
-            interval_min=int(self.interval_var.get() or 60), enabled=True,
-        )
-        if self.plan:
-            self.engine.update_plan(self.plan.id, **data)
-        else:
-            self.engine.add_plan(**data)
-        self.destroy()
+        try:
+            name = self.name_var.get().strip()
+            src = self.src_var.get().strip()
+            if not name:
+                tk.messagebox.showwarning("提示", "请填写计划名称", parent=self)
+                return
+            if not src:
+                tk.messagebox.showwarning("提示", "请选择源文件夹", parent=self)
+                return
+            if not os.path.isdir(os.path.expanduser(src)):
+                tk.messagebox.showwarning("提示", "源文件夹不存在，请重新选择", parent=self)
+                return
+            try:
+                interval = int(self.interval_var.get() or 60)
+            except ValueError:
+                interval = 60
+            base = self.dest_var.get()
+            sub = self.dest_sub_var.get().strip().strip("/")
+            if base == "自定义…":
+                dest_rel = sub
+            else:
+                dest_rel = "/".join(x for x in (base, sub) if x)
+            data = dict(
+                name=name, source=os.path.expanduser(src), dest_rel=dest_rel,
+                mode=self.mode_var.get(),
+                delete_after=bool(self.del_after_var.get()),
+                schedule=self.sched_var.get(), interval_min=interval,
+                enabled=True,
+            )
+            if self.plan:
+                self.engine.update_plan(self.plan.id, **data)
+            else:
+                self.engine.add_plan(**data)
+            self.destroy()
+        except Exception as e:
+            tk.messagebox.showerror("保存失败", f"{e}\n\n请重试", parent=self)
 
 
 class SyncPanel(tk.Toplevel):
@@ -261,14 +322,26 @@ class SyncPanel(tk.Toplevel):
         top.pack(fill="x")
         tk.Label(top, text=p.name, font=self.font_bold, bg=CARD, fg=TEXT).pack(side="left")
         mode_txt = "镜像" if p.mode == "mirror" else "备份"
-        sched_txt = {"manual": "手动", "interval": f"每 {p.interval_min} 分钟",
-                     "watch": "文件变化"}.get(p.schedule, "手动")
-        tk.Label(top, text=f"{mode_txt} · {sched_txt}", font=("PingFang SC", 9),
+        del_txt = " · 传完删本机" if (p.delete_after and p.mode == "backup") else ""
+        tk.Label(top, text=mode_txt + del_txt, font=("PingFang SC", 9),
                  bg=CARD, fg=SUBTEXT).pack(side="right")
 
         tk.Label(card, text=f"{p.source}  →  /{p.dest_rel}",
                  font=("PingFang SC", 9), bg=CARD, fg=SUBTEXT, wraplength=390,
                  justify="left").pack(anchor="w", pady=(4, 0))
+
+        # 触发方式（每个计划独立）
+        schedrow = tk.Frame(card, bg=CARD)
+        schedrow.pack(fill="x", pady=(6, 0))
+        tk.Label(schedrow, text="触发：", font=("PingFang SC", 9), bg=CARD,
+                 fg=SUBTEXT).pack(side="left")
+        sched_val = {"manual": "手动", "interval": "定时", "watch": "文件变化"}.get(p.schedule, "手动")
+        sched_cb = ttk.Combobox(schedrow, values=["手动", "定时", "文件变化"],
+                                state="readonly", width=9, font=("PingFang SC", 9))
+        sched_cb.set(sched_val)
+        sched_cb.pack(side="left")
+        sched_cb.bind("<<ComboboxSelected>>",
+                      lambda _e, pid=p.id, cb=sched_cb: self._set_schedule(pid, cb.get()))
 
         # 进度条 + 状态
         bar = ttk.Progressbar(card, maximum=100, mode="determinate")
@@ -318,6 +391,10 @@ class SyncPanel(tk.Toplevel):
 
     def _toggle(self, pid, val):
         self.engine.update_plan(pid, enabled=val)
+
+    def _set_schedule(self, pid, txt):
+        val = {"手动": "manual", "定时": "interval", "文件变化": "watch"}.get(txt, "manual")
+        self.engine.update_plan(pid, schedule=val)
 
     def _start(self, pid):
         p = self.engine.get_plan(pid)
@@ -414,8 +491,8 @@ class App(tk.Tk):
                                   justify="left", wraplength=310)
         self.conn_text.pack(anchor="w", pady=(6, 0))
         self.open_official_btn = tk.Button(conn_card, text="打开小米智能存储 App", font=self.font_small,
-                                           bg=ORANGE, fg="white", relief="flat", bd=0, padx=10, pady=5,
-                                           activebackground="#e05e00", activeforeground="white",
+                                           bg="#e5e5ea", fg=TEXT, relief="flat", bd=0, padx=10, pady=5,
+                                           activebackground="#d1d1d6", activeforeground=TEXT,
                                            command=self._open_official)
         self.open_official_btn.pack(anchor="w", pady=(8, 0))
 
@@ -450,8 +527,8 @@ class App(tk.Tk):
                                   font=self.font_small, bg=CARD, fg=SUBTEXT, justify="left",
                                   wraplength=310)
         self.sync_text.pack(anchor="w", pady=(6, 0))
-        tk.Button(sync_card, text="打开同步面板", font=self.font_small, bg=ORANGE, fg="white",
-                  relief="flat", bd=0, padx=14, pady=5, activebackground="#e05e00",
+        tk.Button(sync_card, text="打开同步面板", font=self.font_small, bg="#e5e5ea",
+                  fg=TEXT, relief="flat", bd=0, padx=14, pady=5, activebackground="#d1d1d6",
                   command=self._open_sync_panel).pack(anchor="w", pady=(8, 0))
 
         # 设置
@@ -510,15 +587,24 @@ class App(tk.Tk):
 
     def refresh(self):
         st = self.core.conn.snapshot()
-        # 状态点
-        color = GREEN if st["connected"] else (RED if st["error"] else GRAY)
+        mounted = self.core.is_mounted()
+        # 状态点：Finder 已挂载即视为 NAS 可达（代理运行中），即使快路径探测暂时失败
+        if st["connected"] or mounted:
+            color = GREEN
+            self.status_label.config(text="在线" if st["connected"] else "已挂载（代理运行中）")
+        else:
+            color = RED if st["error"] else GRAY
+            self.status_label.config(text="离线")
         self.status_dot.itemconfig(self.dot, fill=color)
-        self.status_label.config(text="在线" if st["connected"] else "离线")
 
         # 连接信息
         if st["connected"]:
             mode = "P2P 隧道（跨网络访问）" if st["mode"] == "p2p" else "局域网直连"
             self.conn_text.config(text=f"已连接 · {mode}\nWebDAV 隧道端口 {st['webdav_port']}")
+            self.open_official_btn.pack_forget()
+        elif mounted:
+            # Finder 已挂载：连接由运行中的本地代理维持，探测失败不误导为离线
+            self.conn_text.config(text="已挂载（代理运行中）\nNAS 可达，可正常访问")
             self.open_official_btn.pack_forget()
         else:
             msg = st["error"] or "未连接"
@@ -536,7 +622,7 @@ class App(tk.Tk):
             self.storage_text.config(text=f"已用 {human_size(used)} / 共 {human_size(total)}（{pct:.1f}%）")
         else:
             self.storage_bar["value"] = 0
-            self.storage_text.config(text="存储信息不可用（不影响挂载）")
+            self.storage_text.config(text="存储信息获取失败（不影响挂载与同步）")
 
         # 挂载状态
         mounted = self.core.is_mounted()
