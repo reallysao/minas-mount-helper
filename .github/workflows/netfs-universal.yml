@@ -1,0 +1,77 @@
+name: netfs-universal
+
+on:
+  push:
+    branches: [fix/sdd-webdav-hardening, main]
+    paths:
+      - "mountapp/netfs_mount.m"
+      - "mountapp/netfs_mount"
+      - ".github/workflows/netfs-universal.yml"
+  pull_request:
+    paths:
+      - "mountapp/netfs_mount.m"
+      - "mountapp/netfs_mount"
+      - ".github/workflows/netfs-universal.yml"
+  workflow_dispatch:
+
+jobs:
+  build-universal:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile arm64 and x86_64 with Apple SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/netfs
+          SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+          MIN_VERSION="11.0"
+          COMMON=(
+            -fobjc-arc
+            -Wall -Wextra -Werror
+            -isysroot "$SDK_PATH"
+            -mmacosx-version-min="$MIN_VERSION"
+            -framework Foundation
+            -framework NetFS
+          )
+          xcrun clang -arch arm64 "${COMMON[@]}" mountapp/netfs_mount.m -o build/netfs/netfs_mount.arm64
+          xcrun clang -arch x86_64 "${COMMON[@]}" mountapp/netfs_mount.m -o build/netfs/netfs_mount.x86_64
+          xcrun lipo -create \
+            build/netfs/netfs_mount.arm64 \
+            build/netfs/netfs_mount.x86_64 \
+            -output build/netfs/netfs_mount
+          chmod 0755 build/netfs/netfs_mount
+
+      - name: Verify architecture, protocol and mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun lipo build/netfs/netfs_mount -verify_arch arm64 x86_64
+          file build/netfs/netfs_mount
+          ARCHS="$(xcrun lipo -archs build/netfs/netfs_mount)"
+          [[ " $ARCHS " == *" arm64 "* ]]
+          [[ " $ARCHS " == *" x86_64 "* ]]
+          [[ "$(build/netfs/netfs_mount --protocol)" == "MWDAV_MOUNT_PROTOCOL=2" ]]
+          [[ "$(stat -f '%Lp' build/netfs/netfs_mount)" == "755" ]]
+          shasum -a 256 build/netfs/netfs_mount | tee build/netfs/netfs_mount.sha256
+
+      - name: Verify checked-in helper contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun lipo mountapp/netfs_mount -verify_arch arm64 x86_64
+          [[ "$(mountapp/netfs_mount --protocol)" == "MWDAV_MOUNT_PROTOCOL=2" ]]
+          [[ "$(stat -f '%Lp' mountapp/netfs_mount)" == "755" ]]
+
+      - name: Upload verified Universal helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: netfs_mount-universal-macos11
+          path: |
+            build/netfs/netfs_mount
+            build/netfs/netfs_mount.sha256
+          if-no-files-found: error
+          retention-days: 14

@@ -1,48 +1,134 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-应用核心：编排 连接发现 -> 代理 -> Finder 挂载 -> 自动重连
+控制面兼容模块：配置、目标发布、挂载身份与 Finder 操作。
+
+最终架构由 ResidentService 作为唯一运行时所有者；AppCore 提供可注入的发现/挂载适配能力，
+不得被 GUI 作为第二个后台控制面启动。目标经 state_store.publish_target 的 CAS 发布，代理只读；
+挂载只认领本地代理 127.0.0.1:18445，凭证经 stdin；常驻服务内嵌 ProxyServer，GUI 退出后
+发现、轮换与自愈继续运行。
 """
-import os
-import sys
-import re
-import time
+import base64
+import http.client
 import json
-import shutil
-import threading
+import os
+import re
 import subprocess
+import sys
+import threading
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import conn_manager as cm
-import mwdav_proxy as mp
-from mwdav_proxy import is_port_in_use
 
 APP_SUPPORT = os.path.expanduser("~/Library/Application Support/小米智能存储挂载助手")
 CONFIG_PATH = os.path.join(APP_SUPPORT, "config.json")
 NETFS_MOUNT = os.path.join(BASE_DIR, "netfs_mount")
 PROXY_PORT = 18445
-MOUNT_URL = f"http://127.0.0.1:{PROXY_PORT}/"
+PROXY_HOST = "127.0.0.1"
+MOUNT_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/"
+DEFAULT_MOUNT_POINT = "/Volumes/127.0.0.1"
+
+# NetFS helper 能力版本标记（与 netfs_mount.m --protocol 对齐）；旧二进制无标记一律拒绝。
+PROTOCOL_MARKER = "MWDAV_MOUNT_PROTOCOL=2"
 
 DEFAULT_CONFIG = {
-    "auto_mount": True,       # 连接后自动挂载
-    "auto_start": False,      # 登录时自动启动
-    "mount_dir": "",          # 空 = 挂载到 /Volumes（Finder 侧边栏可见）
-    "quark_auto_mount": True, # 开机自动挂载夸克网盘
+    "auto_mount": True,
+    "auto_start": False,
+    "mount_dir": "",
 }
 
-# 夸克网盘 WebDAV（qdav 桥接）
-QUARK_URL = "http://MzNMukSvvH:DyJyaZBte6@118.89.62.59:5050/"
-QUARK_VOLUME = "/Volumes/118.89.62.59"
+
+def load_app_config(path=CONFIG_PATH, override=None):
+    """读取应用配置：已保存值覆盖默认值，未知但合法的 TLS 键予以保留。"""
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            cfg.update(saved)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        pass
+    if isinstance(override, dict):
+        cfg.update(override)
+    return cfg
+
+
+def save_app_config(config, path=CONFIG_PATH):
+    """以 0600 原子保存配置；失败向调用者抛出，不能让 UI 假装已保存。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    tmp = path + ".tmp.%d.%d" % (os.getpid(), threading.get_ident())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ======================= 挂载身份（纯函数，可单测） =======================
+
+def parse_mount_table(lines, host=PROXY_HOST, port=PROXY_PORT):
+    """解析 /sbin/mount 输出，返回 [{source,host,port,mountpoint}]，不做认领。"""
+    entries = []
+    for line in lines or []:
+        if " on " not in line:
+            continue
+        src, rest = line.split(" on ", 1)
+        m = re.match(r"\s*(\S+?)\s+\((.*)\)\s*$", rest.strip())
+        mp = m.group(1) if m else rest.split()[0]
+        netloc = src[2:] if src.startswith("//") else src
+        if "@" in netloc:
+            netloc = netloc.split("@", 1)[1]
+        h, _, p = netloc.partition(":")
+        p = p.rstrip("/")
+        entries.append({
+            "source": src.strip(),
+            "host": h.strip(),
+            "port": int(p) if p.isdigit() else None,
+            "mountpoint": mp.strip(),
+            "raw": line.rstrip(),
+        })
+    return entries
+
+
+def _port_in_use(port, host=PROXY_HOST, timeout=0.5):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 class AppCore:
-    def __init__(self):
-        self.conn = cm.ConnManager()
+    def __init__(self, config=None):
+        self.config = self._load_config(config)
+        # 严格 TLS 配置（fail-closed）；缺 server_name/CA 在发现层阻断
+        try:
+            self.tls = cm.load_tls_config(self.config)
+        except cm.TlsConfigError as e:
+            self.tls = None
+            self._tls_error = e.diagnostic
+        self.conn = cm.ConnManager(tls=getattr(self, "tls", None))
         self.conn.exclude_port = PROXY_PORT
         self.proxy_proc = None
-        self.config = self._load_config()
+        # 常驻服务内嵌代理钩子：非 None 时 ensure_proxy 直接复用进程内代理，不再 fork 子进程
+        self.embedded_proxy = None
         self.lock = threading.Lock()
         self.mounted = False
         self.mount_path = None
@@ -50,41 +136,66 @@ class AppCore:
         self.refresh_interval = 20
         self._stop = threading.Event()
         self._thread = None
-        self._dead_streak = 0  # 连续探活失败次数（用于卸载死挂载）
-        self._stale_streak = 0  # 连续死挂载检测次数（mount 表在但挂载点读不出真实内容）
+        self._storage_thread = None
+        self._generation = None
+        self._dead_streak = 0
+        self._stale_streak = 0
+        self._user_unmounted = False  # 用户主动卸载意图，下一轮不自动挂回
 
     # ---------- 配置 ----------
-    def _load_config(self):
-        try:
-            os.makedirs(APP_SUPPORT, exist_ok=True)
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                for k in DEFAULT_CONFIG:
-                    cfg.setdefault(k, DEFAULT_CONFIG[k])
-                return cfg
-        except Exception:
-            pass
-        return dict(DEFAULT_CONFIG)
+    def _load_config(self, override=None):
+        return load_app_config(CONFIG_PATH, override)
 
     def save_config(self):
+        save_app_config(self.config, CONFIG_PATH)
+
+    # ---------- 状态模块（延迟导入；未就绪不本地另写实现） ----------
+    def _state_store(self):
         try:
-            os.makedirs(APP_SUPPORT, exist_ok=True)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
+            import state_store
+            return state_store
         except Exception:
-            pass
+            return None
+
+    def _snapshot(self):
+        ss = self._state_store()
+        if ss is None:
+            return None
+        try:
+            return ss.load_snapshot()
+        except Exception:
+            return None
+
+    def _publish_target(self, port, username, password):
+        ss = self._state_store()
+        if ss is None:
+            self.status_text = "共享状态模块 state_store 未就绪，目标未发布"
+            return False
+        tls = None
+        if self.tls is not None:
+            tls = ss.TlsTarget(ca_file=self.tls.ca_file, cert_file=self.tls.cert_file,
+                               key_file=self.tls.key_file,
+                               server_name=self.tls.server_name)
+        try:
+            snap = ss.publish_target(
+                host=PROXY_HOST, port=port, username=username, password=password,
+                base="/pool0/data", tls=tls,
+                expected_generation=self._generation)
+        except Exception as e:
+            self.status_text = f"目标发布失败: {e}"
+            return False
+        self._generation = getattr(snap, "generation", None)
+        return True
 
     # ---------- 连接 ----------
     def refresh_connection(self, force=False):
         return self.conn.refresh(force=force)
 
-    # ---------- 代理（独立子进程，随 App 退出仍存活，避免已挂载卷失效） ----------
+    # ---------- 代理进程（独立子进程；凭证只经状态文件，不进 argv） ----------
     @staticmethod
     def _proxy_pid_on(port):
-        """返回占用端口的进程 PID（任意）"""
         try:
-            r = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN"],
+            r = subprocess.run(["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN"],
                                capture_output=True, text=True, timeout=5)
             for line in (r.stdout or "").splitlines()[1:]:
                 parts = line.split()
@@ -104,7 +215,11 @@ class AppCore:
             return ""
 
     def ensure_proxy(self):
-        """确保本地代理进程在跑（复用已有 mwdav_proxy 进程，否则拉起新进程）"""
+        # 常驻内嵌模式：复用进程内 ProxyServer，不再拉起独立代理子进程
+        if self.embedded_proxy is not None:
+            if not getattr(self.embedded_proxy, "is_running", lambda: False)():
+                self.embedded_proxy.start()
+            return True
         pid = self._proxy_pid_on(PROXY_PORT)
         if pid:
             cl = self._cmdline(pid)
@@ -127,97 +242,151 @@ class AppCore:
             self.status_text = f"代理启动失败: {e}"
             return False
         for _ in range(20):
-            if is_port_in_use(PROXY_PORT):
+            if _port_in_use(PROXY_PORT):
                 return True
             time.sleep(0.3)
         self.status_text = "代理进程已启动但端口未就绪，请稍候"
         return False
 
-    def update_proxy_target(self):
-        st = self.conn.snapshot()
-        if st["connected"] and st["webdav_port"] and st["username"] and st["password"]:
-            mp.UP.update(port=st["webdav_port"], username=st["username"],
-                         password=st["password"], connected=True)
-            return True
-        mp.UP.update(connected=False)
-        return False
+    # ---------- 挂载身份与认领（T07/T08） ----------
+    def _expected_mountpoint(self):
+        return self.config.get("mount_dir") or DEFAULT_MOUNT_POINT
 
-    # ---------- 挂载 ----------
-    def find_mount_path(self):
-        """WebDAV 挂载点通常为 /Volumes/127.0.0.1
-        结果缓存 10 秒：已挂载时避免每 2 秒跑 /sbin/mount 子进程（省 CPU）"""
-        if self.config.get("mount_dir"):
-            return self.config["mount_dir"]
-        if (self.mount_path and os.path.isdir(self.mount_path)
-                and time.time() - getattr(self, "_mp_ts", 0) < 10):
-            return self.mount_path
-        self._mp_ts = time.time()
-        for name in os.listdir("/Volumes"):
-            p = os.path.join("/Volumes", name)
-            if os.path.ismount(p):
-                out = subprocess.run(["/sbin/mount"], capture_output=True, text=True).stdout or ""
-                for line in out.splitlines():
-                    if p in line and "webdav" in line:
-                        return p
+    def _own_mount_entry(self):
+        """仅认领源为本代理回环端点、且挂载点匹配期望的条目。"""
+        try:
+            out = subprocess.run(["/sbin/mount"], capture_output=True, text=True)
+            lines = (out.stdout or "").splitlines()
+        except Exception:
+            return None
+        expected = self._expected_mountpoint()
+        for e in parse_mount_table(lines, PROXY_HOST, PROXY_PORT):
+            if e["host"] == PROXY_HOST and e["port"] == PROXY_PORT \
+                    and os.path.normpath(e["mountpoint"]) == os.path.normpath(expected):
+                return e
         return None
+
+    def find_mount_path(self):
+        entry = self._own_mount_entry()
+        return entry["mountpoint"] if entry else None
 
     def is_mounted(self):
         p = self.find_mount_path()
         if p:
             self.mount_path = p
+            self.mounted = True
             return True
         self.mount_path = None
+        self.mounted = False
         return False
 
-    def mount(self):
-        """执行挂载（NetFS，带凭证，无弹窗）"""
-        st = self.conn.snapshot()
-        if not (st["connected"] and st["webdav_port"] and st["username"] and st["password"]):
+    # ---------- NetFS helper 能力握手（拒绝旧二进制） ----------
+    def _helper_protocol(self):
+        try:
+            r = subprocess.run([NETFS_MOUNT, "--protocol"],
+                               capture_output=True, text=True, timeout=5)
+            return r.stdout or ""
+        except Exception:
+            return ""
+
+    def _helper_supported(self):
+        return PROTOCOL_MARKER in self._helper_protocol()
+
+    # ---------- 挂载（凭证走 stdin，不进 argv） ----------
+    def mount_with_credentials(self, url, mountpoint, username, password):
+        """用调用方已确认的目标执行 NetFS 挂载。
+
+        常驻服务是发现状态的唯一所有者，因此生产 MountBackend 必须把服务当前
+        DiscoveryView 中的凭证显式传入，不能再从一个新建 AppCore 的空 ConnManager
+        快照取值。默认 /Volumes/127.0.0.1 由 NetFS 自行选择，不作为显式 mountpoint
+        传入，以保持 Finder 可浏览行为；自定义 /Volumes 路径才传给 helper。
+        """
+        if not (url and username and password):
             self.status_text = "无法挂载：连接或凭证不可用"
             return False, "连接不可用"
-        if not self.update_proxy_target():
-            return False, "代理目标未更新"
-        if not self.ensure_proxy():
-            return False, "代理未启动"
         if self.is_mounted():
             self.status_text = "已挂载"
             return True, "已挂载"
-        # 若存在残留挂载点目录（上次异常退出遗留），先清理
-        if os.path.exists("/Volumes/127.0.0.1") and not self.find_mount_path():
-            self.unmount()
-        cmd = [NETFS_MOUNT, "mount", MOUNT_URL, st["username"], st["password"]]
+        if not self._helper_supported():
+            self.status_text = "挂载组件版本过旧：请在 macOS 重新编译 netfs_mount"
+            return False, "helper 协议过旧，需重新编译"
+
+        requested = mountpoint or ""
+        explicit = "" if os.path.normpath(requested or DEFAULT_MOUNT_POINT) \
+            == os.path.normpath(DEFAULT_MOUNT_POINT) else requested
+        args = [NETFS_MOUNT, "mount", url]
+        if explicit:
+            args.append(explicit)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
-            out = (r.stdout or "") + (r.stderr or "")
-            if "MOUNT_OK" in out:
-                self.mounted = True
-                self.status_text = "挂载成功"
-                return True, "挂载成功"
-            # err=16/17（已挂载/资源忙）→ 再次确认挂载表，视为已挂载
-            if "MOUNT_FAIL" in out and any(e in out for e in ("err=16", "err=17")):
-                p = self.find_mount_path()
-                if p:
-                    self.mounted = True
-                    self.mount_path = p
-                    self.status_text = "已挂载（复用现有挂载）"
-                    return True, "已挂载"
-            self.status_text = f"挂载失败: {out.strip()[:100]}"
-            return False, out.strip()[:200]
+            proc = subprocess.Popen(
+                args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+            out, err = proc.communicate(
+                input=f"{username}\n{password}\n".encode(), timeout=40)
+            text = (out or b"").decode("utf-8", "replace") + \
+                (err or b"").decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            # communicate 超时不会自动终止子进程；必须 kill 后再次 communicate 以回收，
+            # 避免 helper 在后台继续执行一次迟到的挂载。
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.communicate()
+            except Exception:
+                pass
+            self.status_text = "挂载失败: netfs_mount 超时，已终止并回收"
+            return False, "挂载超时，helper 已终止"
         except Exception as e:
             self.status_text = f"挂载失败: {e}"
             return False, str(e)
 
+        if "MOUNT_OK" in text:
+            self._user_unmounted = False
+            self.mounted = True
+            self.status_text = "挂载成功"
+            return True, "挂载成功"
+        if "MOUNT_FAIL" in text and any(x in text for x in ("err=16", "err=17")):
+            if self.is_mounted():
+                self._user_unmounted = False
+                self.status_text = "已挂载（复用现有挂载）"
+                return True, "已挂载"
+        self.status_text = f"挂载失败: {text.strip()[:100]}"
+        return False, text.strip()[:200]
+
+    def mount(self):
+        """GUI 会话兼容入口：从本会话 ConnManager 取目标后调用显式凭证挂载。"""
+        st = self.conn.snapshot()
+        if not (st["connected"] and st["webdav_port"] and st["username"] and st["password"]):
+            self.status_text = "无法挂载：连接或凭证不可用"
+            return False, "连接不可用"
+        if not self._publish_target(st["webdav_port"], st["username"], st["password"]):
+            return False, "代理目标未发布"
+        if not self.ensure_proxy():
+            return False, "代理未启动"
+        return self.mount_with_credentials(
+            MOUNT_URL, self._expected_mountpoint(), st["username"], st["password"])
+
     def unmount(self):
-        p = self.find_mount_path()
-        if not p:
+        entry = self._own_mount_entry()
+        if not entry:
             self.mounted = False
+            self.mount_path = None
             self.status_text = "未挂载"
             return True, "未挂载"
-        r = subprocess.run([NETFS_MOUNT, "unmount", p], capture_output=True, text=True, timeout=30)
-        out = (r.stdout or "") + (r.stderr or "")
+        p = entry["mountpoint"]
+        try:
+            r = subprocess.run([NETFS_MOUNT, "unmount", p],
+                               capture_output=True, text=True, timeout=30)
+            out = (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            return False, str(e)
         ok = "UNMOUNT_OK" in out
         if ok:
             self.mounted = False
+            self.mount_path = None
+            self._user_unmounted = True  # 保留用户意图，下一轮不自动挂回
             self.status_text = "已卸载"
         else:
             self.status_text = f"卸载失败: {out.strip()[:80]}"
@@ -230,63 +399,30 @@ class AppCore:
         subprocess.Popen(["open", p])
         return True, p
 
-    # ---------- 夸克网盘 ----------
-    def quark_is_mounted(self):
-        return os.path.ismount(QUARK_VOLUME)
+    # ---------- 健康探活（凭证从快照读取，不进 argv） ----------
+    def _basic(self):
+        snap = self._snapshot()
+        if snap is None:
+            return None
+        return getattr(snap, "username", ""), getattr(snap, "password", "")
 
-    def quark_mount(self):
-        if self.quark_is_mounted():
-            return True, "已挂载"
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", f'mount volume "{QUARK_URL}"'],
-                capture_output=True, text=True, timeout=40)
-            time.sleep(3)
-            if self.quark_is_mounted():
-                return True, "夸克网盘挂载成功"
-            return False, (r.stderr or r.stdout or "挂载失败").strip()[:150]
-        except Exception as e:
-            return False, str(e)
-
-    def quark_unmount(self):
-        if not self.quark_is_mounted():
-            return True, "未挂载"
-        try:
-            subprocess.run(["umount", QUARK_VOLUME], capture_output=True, timeout=20)
-            time.sleep(1)
-            if not self.quark_is_mounted():
-                return True, "已卸载"
-            # 强制
-            subprocess.run(["diskutil", "unmount", QUARK_VOLUME], capture_output=True, timeout=20)
-            return not self.quark_is_mounted(), "已卸载"
-        except Exception as e:
-            return False, str(e)
-
-    def quark_open_finder(self):
-        if not self.quark_is_mounted():
-            return False, "未挂载"
-        subprocess.Popen(["open", QUARK_VOLUME])
-        return True, QUARK_VOLUME
-
-    # ---------- 挂载健康自愈 ----------
     def proxy_alive(self, timeout=3):
-        """通过本地代理探测上游：代理 200/207 说明隧道+凭证正常。
-        返回 True=正常，False=上游不可达（挂载将失效）"""
+        cred = self._basic()
+        if not cred or not cred[0]:
+            return False
         try:
-            r = subprocess.run(
-                ["curl", "-s", "-m", str(timeout), "-u",
-                 "%s:%s" % (mp.UP.snapshot()["username"], mp.UP.snapshot()["password"]),
-                 "-X", "OPTIONS", "-o", "/dev/null", "-w", "%{http_code}", MOUNT_URL],
-                capture_output=True, text=True, timeout=timeout + 2)
-            code = (r.stdout or "").strip()
-            return code in ("200", "207")
+            conn = http.client.HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=timeout)
+            token = base64.b64encode(f"{cred[0]}:{cred[1]}".encode()).decode()
+            conn.request("OPTIONS", "/", headers={"Authorization": f"Basic {token}"})
+            resp = conn.getresponse()
+            resp.read()
+            code = resp.status
+            conn.close()
+            return code in (200, 207)
         except Exception:
             return False
 
     def mount_point_alive(self, timeout=8):
-        """验证挂载点是否真实可用（防 macOS 死挂载：mount 表在但连接已断，Finder 打不开）。
-        方法：通过挂载点读取根目录列表，与代理 PROPFIND 的权威目录集合对比。
-        挂载点能列出任一真实条目即视为活着；读不到（失败/超时/空缓存）则判死。"""
         p = self.find_mount_path()
         if not p:
             return False
@@ -295,35 +431,33 @@ class AppCore:
                                text=True, timeout=timeout)
             if r.returncode != 0:
                 return False
-            local_items = {x for x in r.stdout.splitlines()
-                           if x and not x.startswith(".")}
-        except subprocess.TimeoutExpired:
-            return False
+            local = {x for x in r.stdout.splitlines()
+                     if x and not x.startswith(".")}
         except Exception:
             return False
-        # 代理 PROPFIND 根目录，作为权威集合
-        try:
-            r2 = subprocess.run(
-                ["curl", "-s", "-m", str(timeout), "-u",
-                 "%s:%s" % (mp.UP.snapshot()["username"], mp.UP.snapshot()["password"]),
-                 "-X", "PROPFIND", "-H", "Depth: 1", MOUNT_URL],
-                capture_output=True, text=True, timeout=timeout + 2)
-            remote_items = {x for x in re.findall(
-                r"<[A-Za-z_][\w.-]*:?displayname>([^<]+)</[A-Za-z_][\w.-]*:?displayname>",
-                r2.stdout or "") if x and not x.startswith(".")}
-        except Exception:
-            remote_items = set()
-        if not remote_items:
-            return True  # 拿不到权威列表时不判死，避免误杀
-        return bool(local_items & remote_items)
+        cred = self._basic()
+        remote = set()
+        if cred and cred[0]:
+            try:
+                conn = http.client.HTTPConnection(PROXY_HOST, PROXY_PORT, timeout=timeout)
+                token = base64.b64encode(f"{cred[0]}:{cred[1]}".encode()).decode()
+                conn.request("PROPFIND", "/", headers={
+                    "Authorization": f"Basic {token}", "Depth": "1"})
+                resp = conn.getresponse()
+                body = resp.read().decode("utf-8", "replace")
+                conn.close()
+                remote = {x for x in re.findall(
+                    r"<[A-Za-z_][\w.-]*:?displayname>([^<]+)</[A-Za-z_][\w.-]*:?displayname>",
+                    body) if x and not x.startswith(".")}
+            except Exception:
+                remote = set()
+        if not remote:
+            return True
+        return bool(local & remote)
 
     def ensure_mount_health(self):
-        """自愈：挂载存在但上游已死（连续 N 次）→ 卸载清理死挂载（消除 macOS
-        「重新连接」弹窗）；上游恢复且未挂载 → 自动重新挂载；
-        挂载点死（mount 表在但读不出真实内容）→ 卸载后自动重挂。
-        凭证未就绪时跳过（避免应用启动瞬间误判误卸）。"""
-        up = mp.UP.snapshot()
-        if not (up["username"] and up["password"]):
+        cred = self._basic()
+        if not cred or not cred[0]:
             return
         mounted = self.is_mounted()
         alive = self.proxy_alive()
@@ -331,10 +465,10 @@ class AppCore:
             self._dead_streak = 0
             if not mounted:
                 self._stale_streak = 0
-                if self.config.get("auto_mount") and self.conn.snapshot()["connected"]:
+                if self.config.get("auto_mount") and not self._user_unmounted \
+                        and self.conn.snapshot()["connected"]:
                     self.mount()
                 return
-            # 已挂载：检测死挂载（挂载点读不出真实内容，连续2次则重挂）
             if not self.mount_point_alive():
                 self._stale_streak += 1
                 if self._stale_streak >= 2:
@@ -347,7 +481,6 @@ class AppCore:
             else:
                 self._stale_streak = 0
             return
-        # 上游不可达
         self._stale_streak = 0
         self._dead_streak += 1
         if mounted and self._dead_streak >= 2:
@@ -355,23 +488,28 @@ class AppCore:
             self.unmount()
             self._dead_streak = 0
 
-    # ---------- 后台循环 ----------
+    # ---------- 后台循环（快路径；慢存储独立线程，不阻塞发布） ----------
     def _loop(self):
         while not self._stop.is_set():
             try:
                 st = self.refresh_connection()
                 if st["connected"]:
                     self.ensure_proxy()
-                    self.update_proxy_target()
+                    self._publish_target(st["webdav_port"], st["username"], st["password"])
                     if not self.status_text or "初始化" in self.status_text:
                         self.status_text = "已就绪"
-                else:
-                    mp.UP.update(connected=False)
-                # 挂载自愈：上游死则清理失效挂载（消除 macOS 弹窗），恢复则自动重挂
                 self.ensure_mount_health()
             except Exception as e:
                 self.status_text = f"后台错误: {e}"
             self._stop.wait(self.refresh_interval)
+
+    def _storage_loop(self):
+        while not self._stop.is_set():
+            try:
+                self.conn.poll_storage()
+            except Exception:
+                pass
+            self._stop.wait(60)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -379,40 +517,24 @@ class AppCore:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        self._storage_thread = threading.Thread(target=self._storage_loop, daemon=True)
+        self._storage_thread.start()
 
     def stop(self):
         self._stop.set()
 
-    # ---------- 系统集成 ----------
-    def set_auto_start(self, enabled):
-        """配置登录自启动（LaunchAgent）"""
+    # ---------- 系统集成（委托可测 launch_agent；runner 接收 argv 列表，测试不写真实系统） ----------
+    def set_auto_start(self, enabled, runner=None, agent_dir=None, uid=None):
         self.config["auto_start"] = enabled
         self.save_config()
-        agent_dir = os.path.expanduser("~/Library/LaunchAgents")
-        os.makedirs(agent_dir, exist_ok=True)
-        plist = os.path.join(agent_dir, "com.minas.mount.plist")
-        if not enabled:
-            subprocess.run(["launchctl", "unload", plist], capture_output=True)
-            try:
-                os.remove(plist)
-            except Exception:
-                pass
-            return
+        import launch_agent as la
+        runner = runner or (lambda argv: subprocess.run(argv, check=True))
+        agent_dir = agent_dir or os.path.expanduser("~/Library/LaunchAgents")
         launcher = os.path.join(BASE_DIR, "launcher.sh")
-        content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.minas.mount</string>
-  <key>ProgramArguments</key>
-  <array><string>{launcher}</string><string>--hidden</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-</dict></plist>
-"""
-        with open(plist, "w", encoding="utf-8") as f:
-            f.write(content)
-        subprocess.run(["launchctl", "unload", plist], capture_output=True)
-        subprocess.run(["launchctl", "load", plist], capture_output=True)
+        if not enabled:
+            la.uninstall(agent_dir, runner=runner, uid=uid)
+            return
+        la.install(launcher, agent_dir, runner=runner, uid=uid)
 
 
 if __name__ == "__main__":

@@ -1,33 +1,255 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-连接管理器：发现「小米智能存储」P2P 隧道、获取 WebDAV 凭证与存储信息
+连接管理器（控制面 · 发现链路）：隧道进程定位 -> 端口枚举 -> 凭证读取 -> 分层探测。
 
-原理：
-- 官方 App 的 MiNasClient（sso_login 原生助手）维护 P2P 隧道，
-  在本机暴露一组 nginx 端口：
-    * luci 网关端口  -> POST /cgi-bin/luci/filemgr/get_pool_info 成功
-    * WebDAV 端口    -> OPTIONS /pool0/data/ 返回 DAV: 1,2
-- 通过 luci 网关可随时获取最新的 WebDAV 用户名/密码与存储统计。
+职责边界：
+- 只负责发现与只读凭证读取；**不发布目标快照**（发布由 AppCore 经 state_store 唯一完成）。
+- TLS fail-closed：CERT_REQUIRED + check_hostname=True，server_name 必须来自显式受信配置；
+  不提供 CERT_NONE、不提供 verify=false 降级，缺配置即阻断（SR-3/T11/D05/D06）。
+- 快路径（PID -> 端口 -> 凭证 -> 确认 WebDAV 端口）成功即可被上层发布；
+  存储统计（get_pool_info）为独立慢路径，绝不阻塞快路径（D07/FR-1.2）。
 """
+import base64
+import dataclasses
+import http.client
+import json
 import os
 import re
-import ssl
-import json
-import time
-import base64
 import socket
+import ssl
 import subprocess
-import urllib.request
-import urllib.error
+import time
 
 # ---------- 常量 ----------
 CERTS = "/Applications/小米智能存储.app/Contents/Resources/extraResources/cert"
 POOL_INFO_PATH = "/cgi-bin/luci/filemgr/get_pool_info"
 WEBDAV_BASE = "/pool0/data"
 SCAN_TIMEOUT = 6
-LOCK = object()
 
+PROXY_STATE = os.path.expanduser(
+    "~/Library/Application Support/小米智能存储挂载助手/proxy_state.json")
+PROXY_PORT = 18445
+
+
+# ======================= TLS 配置（fail-closed，无降级） =======================
+# 严格上下文委托共享模块 tls_transport（CERT_REQUIRED + check_hostname=True，无 verify=false）；
+# 仅在其不可用时使用等价的本地 fail-closed 兜底，规则完全一致。
+try:
+    import tls_transport as _tt
+    TlsConfig = _tt.TlsConfig
+    TlsConfigError = _tt.TlsConfigError
+
+    def build_strict_context(cfg):
+        return _tt.build_client_context(cfg)
+except Exception:  # pragma: no cover - 共享模块缺失时的等价兜底
+    class TlsConfigError(Exception):
+        def __init__(self, diagnostic, code="config"):
+            super().__init__(diagnostic)
+            self.code = code
+            self.diagnostic = diagnostic
+
+    @dataclasses.dataclass(frozen=True)
+    class TlsConfig:
+        ca_file: str | None = None
+        cert_file: str | None = None
+        key_file: str | None = None
+        server_name: str | None = None
+
+    def build_strict_context(cfg):
+        if not cfg.server_name:
+            raise TlsConfigError("tls_server_name 未配置，无法验证服务器身份")
+        if not cfg.ca_file or not os.path.exists(cfg.ca_file):
+            raise TlsConfigError("受信 CA 不可用")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=cfg.ca_file)
+        if cfg.cert_file:
+            ctx.load_cert_chain(certfile=cfg.cert_file, keyfile=cfg.key_file)
+        return ctx
+
+
+# 任何关闭校验的开关都被拒绝（无 verify=false 豁免）。
+_DISABLE_KEYS = ("tls_verify", "MWDAV_TLS_VERIFY")
+
+
+def load_tls_config(config: dict | None = None) -> TlsConfig:
+    """从环境变量（优先）与配置字典构造严格 TLS 配置。
+
+    - server_name 必填（tls_server_name / MWDAV_TLS_SERVER_NAME），缺失即 TlsConfigError。
+    - ca_file 显式给出，否则从本地证书目录自动发现 ca_chain.pem；缺失即错误。
+    - cert_file/key_file 可选（mTLS），缺省自动发现。
+    - 出现任何关闭校验的键 -> TlsConfigError（配置错误，不降级）。
+    """
+    cfg = config or {}
+    for key in _DISABLE_KEYS:
+        if os.environ.get(key) is not None or cfg.get(key) is not None:
+            raise TlsConfigError(
+                f"检测到关闭 TLS 校验的配置项 {key}，本版本不提供降级，按配置错误拒绝")
+
+    server_name = (os.environ.get("MWDAV_TLS_SERVER_NAME")
+                   or cfg.get("tls_server_name"))
+    ca_file = (os.environ.get("MWDAV_TLS_CA_FILE")
+               or cfg.get("tls_ca_file"))
+    cert_file = (os.environ.get("MWDAV_TLS_CERT_FILE")
+                 or cfg.get("tls_cert_file"))
+    key_file = (os.environ.get("MWDAV_TLS_KEY_FILE")
+                or cfg.get("tls_key_file"))
+
+    discovered = find_cert_files() or {}
+    if not server_name:
+        raise TlsConfigError(
+            "未配置 tls_server_name：无法验证服务器身份，发现已阻断；"
+            "请在配置或 MWDAV_TLS_SERVER_NAME 显式给出受信服务器名")
+    if not ca_file:
+        ca_file = discovered.get("ca")
+    if not ca_file or not os.path.exists(ca_file):
+        raise TlsConfigError("受信 CA（ca_chain.pem）不可用，TLS 发现阻断")
+    if not cert_file:
+        cert_file = discovered.get("cert")
+    if not key_file:
+        key_file = discovered.get("key")
+    if cert_file and not os.path.exists(cert_file):
+        raise TlsConfigError(f"客户端证书不可用：{cert_file}")
+    if key_file and not os.path.exists(key_file):
+        raise TlsConfigError(f"客户端私钥不可用：{key_file}")
+    return TlsConfig(ca_file=ca_file, cert_file=cert_file,
+                     key_file=key_file, server_name=server_name)
+
+
+class _VerifiedConn(http.client.HTTPSConnection):
+    """强制以显式 server_name 做 SNI + 主机名验证（URL 仍是回环 127.0.0.1）。"""
+
+    def __init__(self, host, port, ctx, server_name, timeout):
+        super().__init__(host, port, timeout=timeout, context=ctx)
+        self._expected_name = server_name
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(
+            sock, server_hostname=self._expected_name)
+
+
+# ======================= 分层探测结果 =======================
+
+@dataclasses.dataclass(frozen=True)
+class ProbeOutcome:
+    phase: str            # connect | tls | http | dav
+    status: str           # confirmed|auth_required|mtls_required|tls_blocked|not_dav|unreachable
+    http_status: int | None
+    dav_capable: bool
+    client_cert_loaded: bool
+    error_type: str | None
+    diagnostic: str       # 不含密码/私钥
+
+
+def _probe_once(port, cfg: TlsConfig, username, password, timeout,
+                present_cert=True) -> ProbeOutcome:
+    """单端口单次 OPTIONS；严格 TLS，带可选 Basic 认证与客户端证书。
+
+    present_cert=False 时剥离本地客户端证书（匿名 TLS 探测），用于让对端先暴露
+    mTLS 要求，而不是一开始就携带证书把 mtls_required 折叠掉。
+    """
+    eff = cfg if present_cert else dataclasses.replace(
+        cfg, cert_file=None, key_file=None)
+    try:
+        ctx = build_strict_context(eff)
+    except TlsConfigError as e:
+        return ProbeOutcome("tls", "tls_blocked", None, False, False,
+                            e.code, e.diagnostic)
+    conn = _VerifiedConn("127.0.0.1", port, ctx, eff.server_name, timeout)
+    try:
+        headers = {}
+        if username and password:
+            token = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        conn.request("OPTIONS", WEBDAV_BASE + "/", headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        dav = bool(resp.headers.get("DAV"))
+        has_cert = bool(eff.cert_file)
+        if resp.status in (200, 207) and dav:
+            return ProbeOutcome("dav", "confirmed", resp.status, True,
+                                has_cert, "ok", "")
+        if resp.status in (200, 207):
+            return ProbeOutcome("dav", "not_dav", resp.status, False,
+                                has_cert, "missing_dav_header",
+                                "OPTIONS 成功但缺少 DAV 能力头")
+        if resp.status == 401:
+            auth = (resp.headers.get("WWW-Authenticate") or "").lower()
+            return ProbeOutcome(
+                "http", "auth_required", 401, dav, has_cert,
+                "basic_challenge" if "basic" in auth else "unauthorized",
+                "需要 Basic 认证（候选，不丢弃）")
+        return ProbeOutcome("http", "not_dav", resp.status, dav, has_cert,
+                             f"http_{resp.status}", "")
+    except ssl.SSLError as e:
+        msg = str(e)
+        has_cert = bool(eff.cert_file)
+        if "PEER_DID_NOT_RETURN_A_CERTIFICATE" in msg or "CERTIFICATE_REQUIRED" in msg.upper():
+            return ProbeOutcome("tls", "mtls_required", None, False, has_cert,
+                                "client_cert_required", "对端要求客户端证书")
+        if "CERTIFICATE_VERIFY_FAILED" in msg or "hostname" in msg.lower():
+            return ProbeOutcome("tls", "tls_blocked", None, False, has_cert,
+                                "verify_failed", "服务器身份链/主机名校验失败")
+        return ProbeOutcome("tls", "tls_blocked", None, False, has_cert,
+                            "handshake", msg[:120])
+    except (socket.timeout, TimeoutError, OSError) as e:
+        return ProbeOutcome("connect", "unreachable", None, False,
+                            bool(eff.cert_file), type(e).__name__, str(e)[:120])
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def probe_webdav(port, *, username=None, password=None,
+                 tls: TlsConfig | None = None, timeout=SCAN_TIMEOUT) -> ProbeOutcome:
+    """分层探测：匿名先试；401 且有凭证则带 Basic 重试。
+
+    - confirmed：200/207 + DAV。
+    - auth_required：401 Basic 挑战（候选），带凭证重试成功转 confirmed。
+    - mtls_required：对端要求客户端证书（条件性，NAS 策略未知）。
+    - tls_blocked：配置缺失/链/主机名失败，显式阻止。
+    """
+    if tls is None:
+        try:
+            tls = load_tls_config()
+        except TlsConfigError as e:
+            return ProbeOutcome("tls", "tls_blocked", None, False, False,
+                                e.code, e.diagnostic)
+    # 匿名先试（不带本地客户端证书），让对端先暴露 mTLS/401，避免把要求折叠掉
+    first = _probe_once(port, tls, None, None, timeout, present_cert=False)
+
+    # D06：匿名 401 Basic 挑战 → 带凭证重试
+    if first.status == "auth_required" and username and password:
+        return _probe_once(
+            port, tls, username, password, timeout,
+            present_cert=bool(tls.cert_file))
+
+    # D05：对端明确要求客户端证书，或握手以 EOF/中断模糊结束（TLS1.3 下服务端
+    # 拒绝无证书时常表现为 SSLEOFError/EOF violation）且本地已配证书 → 自动带证书
+    # 升级一次；升级后若仍 401，再带 Basic 凭证重试。
+    # verify_failed（链/主机名）绝不用换证书掩盖，不进入升级。升级失败返回原始结果，
+    # 不把模糊失败冒充成 mtls_required。
+    ambiguous = first.error_type in ("client_cert_required", "handshake")
+    can_upgrade = bool(tls.cert_file) and ambiguous and first.status in (
+        "mtls_required", "tls_blocked")
+    if can_upgrade:
+        upgraded = _probe_once(
+            port, tls, None, None, timeout, present_cert=True)
+        if upgraded.status == "confirmed":
+            return upgraded
+        if upgraded.status == "auth_required" and username and password:
+            return _probe_once(
+                port, tls, username, password, timeout, present_cert=True)
+        return first
+    return first
+
+
+# ======================= 本地环境探测（只读） =======================
 
 def _run(cmd, timeout=5):
     try:
@@ -38,22 +260,25 @@ def _run(cmd, timeout=5):
 
 
 def find_cert_files():
-    """定位客户端证书目录与文件"""
+    """定位客户端证书目录与文件（受信本地路径，不学习网络身份）。"""
     dirs = []
     if os.path.isdir(CERTS):
         dirs.append(CERTS)
-    # 兜底：在用户目录下搜索
-    for root in (os.path.expanduser("~/Library/Application Support"),):
-        try:
-            for d in os.listdir(root):
-                p = os.path.join(root, d, "cert")
-                if os.path.isdir(p) and os.path.exists(os.path.join(p, "ca_chain.pem")):
-                    dirs.append(p)
-        except Exception:
-            pass
+    base = os.path.expanduser("~/Library/Application Support")
+    try:
+        for d in os.listdir(base):
+            p = os.path.join(base, d, "cert")
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "ca_chain.pem")):
+                dirs.append(p)
+    except Exception:
+        pass
     for d in dirs:
         cert = key = ca = None
-        for f in os.listdir(d):
+        try:
+            names = os.listdir(d)
+        except Exception:
+            continue
+        for f in names:
             if f.endswith("_cert.pem"):
                 cert = os.path.join(d, f)
                 key = os.path.join(d, f.replace("_cert.pem", "_private_key.pem"))
@@ -64,53 +289,32 @@ def find_cert_files():
     return None
 
 
-def _make_ctx(cert_files):
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    try:
-        if cert_files:
-            ctx.load_cert_chain(certfile=cert_files["cert"], keyfile=cert_files["key"])
-            try:
-                ctx.load_verify_locations(cafile=cert_files["ca"])
-            except Exception:
-                pass
-    except Exception:
-        pass
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-PROXY_STATE = os.path.expanduser(
-    "~/Library/Application Support/小米智能存储挂载助手/proxy_state.json")
-PROXY_PORT = 18445
-
-
 def _proxy_alive():
-    """本地挂载代理是否在运行（lsof 探测 18445 端口）"""
     try:
         r = subprocess.run(
-            ["lsof", "-nP", "-iTCP:%d" % PROXY_PORT, "-sTCP:LISTEN"],
+            ["lsof", "-nP", "-a", "-iTCP:%d" % PROXY_PORT, "-sTCP:LISTEN"],
             capture_output=True, text=True, timeout=4)
         return bool((r.stdout or "").strip())
     except Exception:
         return False
 
 
-def read_proxy_state():
-    """从挂载代理状态文件恢复凭证与上游端口（代理运行中即凭证有效）"""
+def read_legacy(path=PROXY_STATE) -> dict:
+    """纯读兜底：从状态文件取 {username,password,port}；零写副作用。"""
     try:
-        with open(PROXY_STATE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
-        if d.get("username") and d.get("password") and d.get("port"):
-            return d.get("username"), d.get("password"), int(d.get("port"))
+        port = d.get("port")
+        if isinstance(port, int) and 1 <= port <= 65535 and d.get("username") and d.get("password"):
+            return {"username": d["username"], "password": d["password"], "port": port}
     except Exception:
         pass
-    return None, None, None
+    return {}
 
 
 def find_sso_login_pid():
-    """找到官方 App 的原生隧道进程"""
-    out = _run(["pgrep", "-f", "sso_login"])
+    # 按进程名精确匹配，避免 -f 子串命中本进程参数或无关 helper。
+    out = _run(["pgrep", "-x", "sso_login"])
     for line in out.splitlines():
         pid = line.strip()
         if pid.isdigit():
@@ -119,8 +323,9 @@ def find_sso_login_pid():
 
 
 def find_tunnel_ports(pid):
-    """扫描隧道进程监听的 TCP 端口"""
-    out = _run(["lsof", "-nP", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"])
+    # lsof 的多类选择条件默认按 OR 组合；必须用 -a 将目标 PID、TCP socket
+    # 与 LISTEN 状态取交集，否则会把系统其他 App 的监听端口混入候选集。
+    out = _run(["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"])
     ports = set()
     for line in out.splitlines()[1:]:
         parts = line.split()
@@ -131,154 +336,37 @@ def find_tunnel_ports(pid):
     return sorted(ports)
 
 
-def probe_luci(port, cert_files, timeout=SCAN_TIMEOUT):
-    """POST get_pool_info，成功则返回解析结果"""
-    ctx = _make_ctx(cert_files)
-    req = urllib.request.Request(
-        f"https://127.0.0.1:{port}{POOL_INFO_PATH}",
-        data=b"{}", method="POST",
-        headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            data = resp.read()
-            return json.loads(data.decode("utf-8", "replace"))
-    except Exception:
-        return None
-
-
-def probe_webdav(port, timeout=SCAN_TIMEOUT):
-    """OPTIONS /pool0/data/，返回是否 DAV 服务器"""
-    ctx = _make_ctx(None)
-    req = urllib.request.Request(f"https://127.0.0.1:{port}{WEBDAV_BASE}/",
-                                 method="OPTIONS")
-    try:
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            dav = resp.headers.get("DAV")
-            return bool(dav)
-    except Exception:
-        return False
-
-
-def _parallel_first(items, fn, max_workers=16):
-    """并发探测，返回第一个成功结果（fn 返回真值即成功）"""
+def _parallel_first_confirmed(items, fn, max_workers=16):
+    """并发探测并尽快返回首个 confirmed；不等待无关慢探针结束。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(fn, it) for it in items]
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    futs = {ex.submit(fn, it): it for it in items}
+    try:
         for fut in as_completed(futs):
+            port = futs[fut]
             try:
-                r = fut.result()
+                result = fut.result()
             except Exception:
-                r = None
-            if r:
-                return r
-    return None
-
-
-_ED25519_PY = None  # 模块级缓存：已确认支持 Ed25519 的解释器
-
-
-def _find_ed25519_python():
-    """查找支持 Ed25519 客户端证书的解释器（优先 Doubao 运行时，其次当前解释器）"""
-    global _ED25519_PY
-    if _ED25519_PY:
-        return _ED25519_PY
-    import glob as _glob
-    cands = []
-    try:
-        cands += _glob.glob(os.path.expanduser(
-            "~/Library/Application Support/Doubao/sandbox_runtime/bases/*/bin/python3"))
-    except Exception:
-        pass
-    for py in cands:
-        if not os.path.exists(py):
-            continue
-        try:
-            r = subprocess.run([py, "-c", (
-                "import ssl;c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT);"
-                "c.load_cert_chain(r'%s',r'%s');print('OK')"
-            ) % (CERTS + "/2855650711_1191211642_cert.pem",
-                 CERTS + "/2855650711_1191211642_private_key.pem")],
-                capture_output=True, timeout=8)
-            if b"OK" in r.stdout:
-                _ED25519_PY = py
-                return py
-        except Exception:
-            continue
-    return None
-
-
-def probe_pool_info_via_helper(port, timeout=10):
-    """用支持 Ed25519 的解释器（子进程）调 get_pool_info，返回解析结果或 None"""
-    py = _find_ed25519_python()
-    if not py:
+                result = None
+            if result and result.status == "confirmed":
+                for other in futs:
+                    if other is not fut:
+                        other.cancel()
+                return port, result
         return None
-    script = (
-        "import ssl,urllib.request,json,sys\n"
-        "c=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)\n"
-        "c.load_cert_chain(r'%s',r'%s')\n"
-        "c.load_verify_locations(cafile=r'%s')\n"
-        "c.check_hostname=False;c.verify_mode=ssl.CERT_NONE\n"
-        "r=urllib.request.Request('https://127.0.0.1:%d/cgi-bin/luci/filemgr/get_pool_info',"
-        "data=b'{}',method='POST',headers={'Content-Type':'application/json'})\n"
-        "try:\n"
-        " d=urllib.request.urlopen(r,context=c,timeout=%d).read()\n"
-        " print(d.decode('utf-8','replace'))\n"
-        "except Exception as e:\n"
-        " sys.stderr.write(str(e))\n"
-    ) % (CERTS + "/2855650711_1191211642_cert.pem",
-         CERTS + "/2855650711_1191211642_private_key.pem",
-         CERTS + "/ca_chain.pem", port, timeout)
-    try:
-        r = subprocess.run([py, "-c", script], capture_output=True, timeout=timeout + 5)
-        out = r.stdout.decode("utf-8", "replace").strip()
-        if out:
-            return json.loads(out)
-    except Exception:
-        return None
-    return None
+    finally:
+        # cancel_futures 阻止尚未启动的任务；wait=False 保证首个确认不被慢输家拖住。
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
-def _parse_pool_info(info):
-    """从 get_pool_info 结果提取凭证与存储统计"""
-    if not info or info.get("code") != 0:
-        return None
-    data = info.get("data") or {}
-    webdav = data.get("webDAV") or {}
-    pools = data.get("internal_pool") or []
-    storage = []
-    for p in pools:
-        try:
-            total = int(p.get("total_size") or 0)
-            used = int(p.get("used_size") or 0)
-            storage.append({
-                "name": p.get("name") or "存储空间",
-                "total": total,
-                "used": used,
-                "pool_id": p.get("pool_id"),
-            })
-        except Exception:
-            continue
-    return {
-        "username": webdav.get("username"),
-        "password": webdav.get("password"),
-        "webdav_port": webdav.get("port", 5000),
-        "storage": storage,
-    }
-
-
+# ---------- LevelDB 凭证缓存（只读兜底） ----------
 LEVELDB_DIR = os.path.expanduser(
     "~/Library/Application Support/小米智能存储/Partitions/session/Local Storage/leveldb")
-
-
-_LEVELDB_CACHE = {"t": 0.0, "user": None, "pwd": None}  # 凭证缓存（避免每轮重复读几十 MB LevelDB）
+_LEVELDB_CACHE = {"t": 0.0, "user": None, "pwd": None}
 
 
 def read_webdav_from_leveldb():
-    """兜底：从官方 App 的 localStorage(LevelDB) 读取缓存的 WebDAV 密码。
-    官方 App 会把 {username, password, port, uri} 写进 localStorage，
-    密码字段在 Snappy 压缩块中可能被打散，但密码本体保持连续可打印。
-    返回 (username, password) 或 (None, None)。
-    结果缓存 120 秒（凭证稳定，避免高频大文件读取拉高内存与 CPU）。"""
+    """兜底：从官方 App localStorage 读缓存 WebDAV 凭证；120 秒缓存；纯读。"""
     now = time.time()
     if now - _LEVELDB_CACHE["t"] < 120:
         return _LEVELDB_CACHE["user"], _LEVELDB_CACHE["pwd"]
@@ -292,16 +380,10 @@ def read_webdav_from_leveldb():
                 data += open(f, "rb").read()
             except Exception:
                 pass
-        # 密码：形如 <x>assword":"<40-90位可打印串> （x 可能被噪声替换）
-        # 注意：结尾引号可能被 Snappy 压缩块吃掉，导致匹配越过闭合引号，
-        # 吞进后续 JSON（如 "port_2":58313）。故在首个双引号/反斜杠处截断，
-        # 并排除含 JSON 字段特征的候选。
         best = None
         for m in re.finditer(rb'[ -~]?assword":"([ -~]{30,90})', data):
             cand = m.group(1).decode("utf-8", "replace")
-            # 密码本体遇到引号/反斜杠即截断（NAS 生成的密码不含引号）
             cand = re.split(r'["\\]', cand)[0]
-            # 过滤明显不是密码的长串（JSON/base64 内容）
             if cand.startswith(("{", "data:", "http")):
                 continue
             if "port" in cand.lower() or "fid" in cand.lower():
@@ -310,7 +392,6 @@ def read_webdav_from_leveldb():
             if specials >= 3 and any(ch.isdigit() for ch in cand):
                 if best is None or len(cand) > len(best):
                     best = cand
-        # 用户名：u + uid（uid 从证书文件名取）
         user = None
         cf = find_cert_files()
         if cf:
@@ -325,156 +406,202 @@ def read_webdav_from_leveldb():
         return None, None
 
 
-class ConnManager:
-    """连接管理：隧道发现 -> 端口识别 -> 凭证获取，并持续刷新"""
+def _parse_pool_info(info):
+    if not info or info.get("code") != 0:
+        return None
+    data = info.get("data") or {}
+    webdav = data.get("webDAV") or {}
+    pools = data.get("internal_pool") or []
+    storage = []
+    for p in pools:
+        try:
+            storage.append({
+                "name": p.get("name") or "存储空间",
+                "total": int(p.get("total_size") or 0),
+                "used": int(p.get("used_size") or 0),
+                "pool_id": p.get("pool_id"),
+            })
+        except Exception:
+            continue
+    return {
+        "username": webdav.get("username"),
+        "password": webdav.get("password"),
+        "webdav_port": webdav.get("port", 5000),
+        "storage": storage,
+    }
 
-    def __init__(self):
+
+class ConnManager:
+    """发现：PID -> 端口 -> 凭证 -> 分层探测确认 WebDAV 端口。"""
+
+    def __init__(self, tls: TlsConfig | None = None):
         self.state = {
-            "connected": False,        # 隧道可用
-            "mode": "",                # "p2p" / "lan" / ""
-            "luci_port": None,         # luci 网关端口
-            "webdav_port": None,       # NAS WebDAV 隧道端口
+            "connected": False,
+            "mode": "",
+            "luci_port": None,
+            "webdav_port": None,
             "username": "",
             "password": "",
-            "storage": [],             # 存储统计
+            "storage": [],
             "uid": "",
             "error": "",
             "last_check": 0,
+            "pool_check": 0,
         }
+        self.tls = tls
         self.cert_files = find_cert_files()
-        # 测试当前解释器能否加载 Ed25519 客户端证书（系统 Python 3.9 不支持）
-        self.cert_ok = False
-        cf = self.cert_files
-        if cf:
-            try:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.load_cert_chain(certfile=cf["cert"], keyfile=cf["key"])
-                self.cert_ok = True
-            except Exception:
-                self.cert_ok = False
 
     def snapshot(self):
         return dict(self.state)
 
-    def refresh(self, force=False):
-        """执行一轮完整探测；间隔小于 15 秒且非强制则复用缓存。
+    # ---------- 内部 ----------
+    def _reset_stale(self):
+        st = self.state
+        st["connected"] = False
+        st["mode"] = ""
+        st["luci_port"] = None
+        st["webdav_port"] = None
 
-        快路径（每次刷新都走）：隧道 PID -> 端口 -> LevelDB 凭证 -> WebDAV 端口
-        慢路径（存储统计，仅在缓存缺失/过期时）：get_pool_info（Ed25519 子进程）
-        """
+    def _fail(self, msg):
+        st = self.state
+        st["connected"] = False
+        st["mode"] = ""
+        st["luci_port"] = None
+        st["webdav_port"] = None
+        st["error"] = msg
+        return st
+
+    def _ensure_tls(self) -> TlsConfig | None:
+        if self.tls is not None:
+            return self.tls
+        try:
+            self.tls = load_tls_config()
+            return self.tls
+        except TlsConfigError as e:
+            self._fail(f"TLS 配置错误：{e.diagnostic}")
+            return None
+
+    # ---------- 快路径 ----------
+    def refresh(self, force=False):
         now = time.time()
         if not force and now - self.state["last_check"] < 15:
             return self.state
+        self._reset_stale()
         st = self.state
         st["last_check"] = now
         st["error"] = ""
 
-        # ---- 快路径 ----
+        tls = self._ensure_tls()
+        if tls is None:
+            return st
+
         pid = find_sso_login_pid()
         if not pid:
-            # 兜底：本地挂载代理仍在运行（已建立 Finder 挂载）→ 视为在线，
-            # 隧道与凭证由代理维护，不必因为 sso_login 进程名变化而误报离线
+            # 兜底：本地代理存活则从只读状态文件恢复（凭证由代理维持）
             if _proxy_alive():
-                user, pwd, wd_port = read_proxy_state()
-                if user and pwd and wd_port:
-                    st["connected"] = True
-                    st["mode"] = "p2p"
-                    st["username"] = user
-                    st["password"] = pwd
-                    st["webdav_port"] = wd_port
-                    st["error"] = ""
+                legacy = read_legacy()
+                if legacy:
+                    st.update(connected=True, mode="p2p",
+                              username=legacy["username"],
+                              password=legacy["password"],
+                              webdav_port=legacy["port"], error="")
                     return st
-            st["connected"] = False
-            st["mode"] = ""
-            st["luci_port"] = st["webdav_port"] = None
-            st["error"] = "未检测到「小米智能存储」App 的隧道进程（sso_login），请确认 App 正在运行"
-            return st
+            return self._fail("未检测到「小米智能存储」App 的隧道进程（sso_login），请确认 App 正在运行")
 
         ports = find_tunnel_ports(pid)
         if not ports:
-            st["error"] = "隧道进程存在，但未发现隧道端口"
-            return st
+            return self._fail("隧道进程存在，但未发现隧道端口")
+
         own_port = getattr(self, "exclude_port", None)
         if own_port:
             ports = [p for p in ports if p != own_port]
 
-        # 凭证：官方 App 缓存（秒级、稳定）
         user, pwd = read_webdav_from_leveldb()
         if not (user and pwd):
-            # 兜底：LevelDB 缓存读取失败（官方 App 更新/缓存清理），
-            # 但代理进程正在运行 → 用代理状态文件里的凭证
-            u2, p2, _w2 = read_proxy_state()
-            if u2 and p2 and _proxy_alive():
-                user, pwd = u2, p2
-        if user and pwd:
-            st["username"] = user
-            st["password"] = pwd
-        else:
-            st["connected"] = False
-            st["error"] = "未获取到 WebDAV 凭证（缓存缺失），请先登录小米智能存储 App"
-            return st
+            legacy = read_legacy()
+            if legacy and _proxy_alive():
+                user, pwd = legacy["username"], legacy["password"]
+        if not (user and pwd):
+            return self._fail("未获取到 WebDAV 凭证（缓存缺失），请先登录小米智能存储 App")
+        st["username"], st["password"] = user, pwd
 
-        # WebDAV 端口：优先缓存，其次并行扫描
-        wd_port = st.get("webdav_port")
-        if not (wd_port and wd_port in ports and probe_webdav(wd_port, timeout=2)):
-            wd_port = _parallel_first(ports, lambda p: p if probe_webdav(p, timeout=2) else None)
-        if not wd_port:
-            st["connected"] = False
-            st["error"] = "未发现 WebDAV 隧道端口"
-            return st
+        # 并发分层探测；只接受 confirmed，不折叠 401/tls/非DAV
+        found = _parallel_first_confirmed(
+            ports, lambda p: probe_webdav(p, username=user, password=pwd, tls=tls))
+        if found is None:
+            return self._fail("未发现通过身份校验的 WebDAV 隧道端口")
+
+        port, _outcome = found
         st["connected"] = True
         st["mode"] = "p2p"
-        st["webdav_port"] = wd_port
-
-        # ---- 慢路径：存储统计（可选增强，失败不影响挂载）----
-        need_pool = (not st["storage"]) or (now - st.get("pool_check", 0) > 300) or force
-        if need_pool:
-            pool = None
-            luci = st.get("luci_port")
-            # 优先相邻端口（luci 网关通常就在 webdav 端口旁边）
-            for cand in ([luci] if luci else []) + [wd_port - 1, wd_port + 1]:
-                if cand and cand in ports and cand != wd_port:
-                    pool = self._probe_pool_once(cand)
-                    if pool is not None:
-                        luci = cand
-                        break
-            if pool is None:
-                rest = [p for p in ports if p not in (wd_port, luci)]
-
-                def _try_pool(p):
-                    r = self._probe_pool_once(p)
-                    return (p, r) if r is not None else None
-
-                res = _parallel_first(rest, _try_pool)
-                if res:
-                    luci, pool = res
-            if pool is not None:
-                parsed = _parse_pool_info(pool)
-                if parsed:
-                    st["luci_port"] = luci
-                    st["pool_check"] = now
-                    if parsed["storage"]:
-                        st["storage"] = parsed["storage"]
-                    if parsed["username"]:
-                        st["username"] = parsed["username"]
-                    if parsed["password"]:
-                        st["password"] = parsed["password"]
-        m = re.search(r"(\d+)_", (self.cert_files or {}).get("cert", "") or "")
-        if m:
-            st["uid"] = m.group(1)
+        st["webdav_port"] = port
         return st
 
-    def _probe_pool_once(self, port, timeout=5):
-        """单端口调 get_pool_info：当前解释器支持则直连，否则走子进程解释器。
-        只返回 code==0 且可解析的结果；其余情况返回 None。"""
-        pool = None
-        if self.cert_ok:
-            pool = probe_luci(port, self.cert_files, timeout=timeout)
-        else:
-            pool = probe_pool_info_via_helper(port, timeout=timeout)
-        if pool is not None and _parse_pool_info(pool) is not None:
-            return pool
+    # ---------- 慢路径（可选存储统计，独立调用，不阻塞快路径） ----------
+    def poll_storage(self, force=False):
+        """低优先级获取存储统计；失败非致命，绝不影响已发布端口。"""
+        import urllib.request as _urlreq
+        st = self.state
+        need = (not st["storage"]) or (time.time() - st.get("pool_check", 0) > 300) or force
+        if not need:
+            return st
+        pool = self._probe_pool_best(_urlreq)
+        if pool is not None:
+            parsed = _parse_pool_info(pool)
+            if parsed:
+                st["pool_check"] = time.time()
+                if parsed["storage"]:
+                    st["storage"] = parsed["storage"]
+                if parsed["username"]:
+                    st["username"] = parsed["username"]
+                if parsed["password"]:
+                    st["password"] = parsed["password"]
+        return st
+
+    def _probe_pool_best(self, _urlreq):
+        """在隧道端口中找 get_pool_info；仅慢路径使用，失败返回 None。"""
+        pid = find_sso_login_pid()
+        if not pid:
+            return None
+        ports = find_tunnel_ports(pid)
+        own = getattr(self, "exclude_port", None)
+        if own:
+            ports = [p for p in ports if p != own]
+        for p in ports:
+            r = self._probe_pool_once(_urlreq, p)
+            if r is not None:
+                return r
         return None
+
+    def _probe_pool_once(self, _urlreq, port, timeout=5):
+        # _urlreq 保留为兼容入参；慢路径也走严格 _VerifiedConn，SNI 与主机名校验
+        # 一律用显式 server_name，绝不用 URL 里的 127.0.0.1 冒充身份（P2-5）。
+        cf = self.cert_files
+        if not cf or self.tls is None or not self.tls.server_name:
+            return None
+        try:
+            ctx = build_strict_context(
+                TlsConfig(ca_file=cf["ca"], cert_file=cf.get("cert"),
+                          key_file=cf.get("key"), server_name=self.tls.server_name))
+        except TlsConfigError:
+            return None
+        headers = {"Content-Type": "application/json"}
+        user = self.state.get("username") or ""
+        pwd = self.state.get("password") or ""
+        if user and pwd:
+            token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        try:
+            conn = _VerifiedConn("127.0.0.1", port, ctx,
+                                 self.tls.server_name, timeout)
+            conn.request("POST", POOL_INFO_PATH, body=b"{}", headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            conn.close()
+            data = json.loads(raw.decode("utf-8", "replace"))
+            return data if _parse_pool_info(data) is not None else None
+        except Exception:
+            return None
 
 
 if __name__ == "__main__":

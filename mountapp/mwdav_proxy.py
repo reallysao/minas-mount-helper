@@ -1,370 +1,454 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MiNAS WebDAV 反向代理核心模块（性能优化版）
-把「小米智能存储」P2P 隧道暴露的 NAS WebDAV(https://127.0.0.1:动态端口/pool0/data)
-转发为本地稳定的 HTTP WebDAV 端点，供 Finder 原生挂载。
+MiNAS WebDAV 反向代理（硬化版）
 
-性能优化（v2）：
-- 上游连接复用（每线程持久 HTTPS 连接，避免重复 TLS 握手）
-- Finder 元数据请求快速响应（._* / .DS_Store / .Spotlight 等直接 404，不转发上游）
-- PROPFIND 响应缓存（大目录短时间内重复请求直接返回缓存）
-- 上游并发限制（信号量，避免 Finder 大目录同时打爆上游）
-- 上游超时缩短（12s，减少 Finder 卡死时间）
-- 请求体读取异常容错（避免异常 Content-Length 导致线程崩溃）
+职责：把官方 P2P 隧道暴露的 NAS WebDAV 转发为本地稳定 HTTP 端点供 Finder 挂载。
+
+硬化要点（对应 docs/specs/proxy.md）：
+- 入站始终强制 Basic 认证（无匿名/降级开关）；目标未配齐返回 503，绝不匿名转发。
+- 配置（target）与健康（health）分离：读路径纯读零写副作用；代理自身永不发布。
+- 上游 TLS fail-closed：校验信任链 + 期望身份，CA/server_name 显式配置，错误闭锁可诊断。
+- 请求体/响应体有界：超限 413/507，chunked 显式 501，禁止空体转发。
+- PROPFIND 缓存键含 Depth、命名空间无关、硬上限；MOVE/COPY 双端失效。
+- HEAD 原样透传 Content-Length；不安全方法不确定提交结果时不盲重放。
 """
-import http.server
+import base64
+import hashlib
+import hmac
 import http.client
-import ssl
-import threading
-import time
+import http.server
 import json
 import os
 import re
-import base64
 import socket
+import ssl
 import sys
+import threading
+import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import state_store
+import tls_transport
+from state_store import (  # noqa: F401
+    TargetSnapshot, TlsTarget, StateFormatError,
+    load_snapshot, publish_target, read_legacy,
+)
+from tls_transport import (  # noqa: F401
+    TlsConfig, TlsError, TlsConfigError, TlsVerifyError, TlsHandshakeError,
+    TlsLockout, build_client_context, classify_error,
+)
+
+# ---------- 常量 ----------
 DEFAULT_LISTEN_PORT = 18445
 DEFAULT_UPSTREAM_PORT = 49559
 UPSTREAM_BASE = "/pool0/data"
 CERTS = "/Applications/小米智能存储.app/Contents/Resources/extraResources/cert"
-STATE_FILE = os.environ.get(
-    "MWDAV_STATE",
-    os.path.expanduser("~/Library/Application Support/小米智能存储挂载助手/proxy_state.json"))
+STATE_FILE = state_store.default_state_path()
 
-# ---------- 性能调优参数 ----------
-UPSTREAM_TIMEOUT = 12          # 上游请求超时（秒），从 30s 缩短，减少 Finder 卡死
-MAX_CONCURRENT_UPSTREAM = 12   # 上游最大并发请求数，避免大目录同时打爆
-PROPFIND_CACHE_TTL = 8         # PROPFIND 响应缓存时长（秒）
-PROPFIND_CACHE_MAX_ENTRIES = 200  # 缓存最大条目数
-MAX_BODY_SIZE = 200 * 1024 * 1024  # 最大请求体 200MB（保护内存）
+UPSTREAM_TIMEOUT = 12
+MAX_CONCURRENT_UPSTREAM = 12
+PROPFIND_CACHE_TTL = 8
+PROPFIND_CACHE_MAX_ENTRIES = 200
+MAX_REQUEST_BODY = 200 * 1024 * 1024
+MAX_BODY_SIZE = MAX_REQUEST_BODY  # 历史别名
+MAX_RESPONSE_BODY = 64 * 1024 * 1024  # 硬限（非并发总量）；超限 507，流式背压列阶段二
 
-# ---------- Finder 元数据请求模式（直接 404，不转发上游） ----------
-# Finder 列出目录后会对每个文件请求资源叉/元数据，这些在 NAS 上不存在，
-# 每次白跑一趟上游，大目录（几百个视频/图片）会累积巨大延迟。
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "PROPFIND"}
+WRITE_METHODS = {"PUT", "DELETE", "MKCOL", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK"}
+HOP_BY_HOP = {"content-length", "transfer-encoding", "connection", "server", "date",
+              "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+              "upgrade"}
+
+# ---------- Finder 元数据请求（直接 404，不转发上游） ----------
 _META_PATTERNS = [
-    re.compile(r'/\._[^/]+$'),              # AppleDouble 资源叉（._文件名）
-    re.compile(r'/.DS_Store$'),              # Finder 目录元数据
-    re.compile(r'/.Spotlight-V100(/|$)'),   # Spotlight 索引
-    re.compile(r'/.fseventsd(/|$)'),         # 文件系统事件
-    re.compile(r'/.Trashes(/|$)'),           # 回收站
-    re.compile(r'/.VolumeIcon.icns$'),       # 卷图标
-    re.compile(r'/\.hidden$'),                # 隐藏文件列表
+    re.compile(r'/\._[^/]+$'),
+    re.compile(r'/.DS_Store$'),
+    re.compile(r'/.Spotlight-V100(/|$)'),
+    re.compile(r'/.fseventsd(/|$)'),
+    re.compile(r'/.Trashes(/|$)'),
+    re.compile(r'/.VolumeIcon.icns$'),
+    re.compile(r'/\.hidden$'),
 ]
 
 
 def _is_meta_request(path):
-    """判断是否是 Finder 元数据请求（直接 404，不转发上游）"""
-    for p in _META_PATTERNS:
-        if p.search(path):
-            return True
-    return False
+    return any(p.search(path) for p in _META_PATTERNS)
 
 
-def _valid_password(pwd):
-    """NAS 生成的密码不含引号/反斜杠；含这些字符视为被污染的脏数据"""
-    return isinstance(pwd, str) and 20 <= len(pwd) <= 200 and '"' not in pwd and "\\" not in pwd
+class UnknownCommitError(Exception):
+    """发送后无法确认上游是否已提交；不安全方法不得重放。"""
 
 
-def _persist_state():
-    """把当前上游配置写入共享状态文件，供同机器上的其他代理进程读取。
-    密码为空或可疑（含引号）时跳过写入，避免覆盖掉已有有效凭证。"""
-    up = UP.snapshot()
-    if not up["password"] or not _valid_password(up["password"]):
-        return
-    try:
-        d = os.path.dirname(STATE_FILE)
-        if d:
-            os.makedirs(d, exist_ok=True, mode=0o700)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(up, f, ensure_ascii=False)
-        try:
-            os.chmod(STATE_FILE, 0o600)
-            os.chmod(d, 0o700)
-        except Exception:
-            pass
-    except Exception:
-        pass
+class ResponseTooLarge(Exception):
+    """上游响应超过内存上限。"""
 
 
-def _load_shared_state():
-    """读取共享状态文件（若存在），覆盖当前进程内的上游配置。
-    只接受结构合法的数据；密码可疑（含引号/反斜杠）时忽略整个文件，
-    避免被污染的 JSON 注入错误凭证导致全量 401。"""
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return
-        port = data.get("port")
-        pwd = data.get("password")
-        if not (isinstance(port, int) and 1 <= port <= 65535):
-            return
-        if not _valid_password(pwd or ""):
-            return
-        UP.update(port=port, username=data.get("username"),
-                  password=pwd, connected=bool(data.get("connected", False)))
-    except Exception:
-        pass
-
-
-def _check_incoming_auth(headers):
-    """入站认证校验：防止本机其他用户账户/本地进程无凭证访问代理。
-    只有携带与当前 NAS 凭证一致的 Basic 认证才放行（Finder/NetFS 挂载时自动携带）。"""
-    up = UP.snapshot()
-    if not (up["username"] and up["password"]):
-        return True
-    auth = headers.get("Authorization", "") or ""
-    if auth.startswith("Basic "):
-        try:
-            dec = base64.b64decode(auth[6:]).decode("utf-8", "replace")
-            u, _, p = dec.partition(":")
-            if u == up["username"] and p == up["password"]:
-                return True
-        except Exception:
-            return False
-    return False
-
-# ---------- 上游状态（由连接管理器更新） ----------
+# ---------- 上游目标（target）与健康（health）分离 ----------
 class Upstream:
+    """内存持有者：target 可由 client 经 update() 发布，也可由读路径纯读采纳；
+    connected/last_error/lockout 是健康状态，只在内存，永不落盘、永不发布。"""
+
     def __init__(self):
-        self.lock = threading.Lock()
-        self.port = DEFAULT_UPSTREAM_PORT
-        self.username = "u2855650711"
-        self.password = ""
+        self._lock = threading.RLock()
+        # target
         self.host = "127.0.0.1"
+        self.port = DEFAULT_UPSTREAM_PORT
         self.base = UPSTREAM_BASE
+        self.username = ""
+        self.password = ""
+        self.tls = TlsTarget()
+        self.generation = 0
+        # health（memory only）
         self.connected = False
         self.last_error = ""
+        self.lockout = TlsLockout()
 
-    def update(self, port=None, username=None, password=None, connected=None, error=""):
-        with self.lock:
-            if port: self.port = port
-            if username: self.username = username
-            if password is not None: self.password = password
-            if connected is not None: self.connected = connected
-            self.last_error = error
-        _persist_state()
-        # 端口变化时关闭所有缓存连接（连接池中的连接指向旧端口）
-        _connection_pool_reset()
+    # ---- client 配置发布路径（仅 client 调用；代理读/error 路径禁止调用） ----
+    def update(self, port=None, username=None, password=None, connected=None,
+               error="", host=None, base=None, tls=None):
+        target_given = any(v is not None for v in (port, username, password, host, base, tls))
+        with self._lock:
+            if target_given:
+                new_host = self.host if host is None else host
+                new_port = self.port if port is None else port
+                new_base = self.base if base is None else base
+                new_user = self.username if username is None else username
+                new_pwd = self.password if password is None else password
+                new_tls = self.tls if tls is None else tls
+                snap = publish_target(
+                    STATE_FILE, host=new_host, port=new_port,
+                    username=new_user, password=new_pwd, base=new_base, tls=new_tls)
+                self._adopt(snap)
+            if connected is not None:
+                self.connected = connected
+            if error:
+                self.last_error = error
+            elif connected is False:
+                self.last_error = ""
 
-    def snapshot(self):
-        with self.lock:
-            return dict(port=self.port, username=self.username,
-                        password=self.password, host=self.host, base=self.base,
-                        connected=self.connected, last_error=self.last_error)
+    def adopt(self, snap: TargetSnapshot) -> bool:
+        """纯读采纳外部已发布目标，不写盘；身份变化返回 True 并 bump generation。"""
+        with self._lock:
+            return self._adopt(snap)
+
+    def _adopt(self, snap: TargetSnapshot) -> bool:
+        identity = (snap.host, snap.port, snap.username, snap.password,
+                    snap.tls.ca_file, snap.tls.cert_file,
+                    snap.tls.key_file, snap.tls.server_name)
+        current = (self.host, self.port, self.username, self.password,
+                   self.tls.ca_file, self.tls.cert_file,
+                   self.tls.key_file, self.tls.server_name)
+        if identity == current:
+            return False
+        self.generation += 1
+        self.host, self.port, self.base = snap.host, snap.port, snap.base
+        self.username, self.password = snap.username, snap.password
+        self.tls = snap.tls
+        return True
+
+    def set_health(self, connected=None, error=""):
+        with self._lock:
+            if connected is not None:
+                self.connected = connected
+            if error:
+                self.last_error = error
+            elif connected is False:
+                self.last_error = ""
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "host": self.host, "port": self.port, "base": self.base,
+                "username": self.username, "password": self.password,
+                "tls": self.tls, "generation": self.generation,
+                "connected": self.connected, "last_error": self.last_error,
+            }
+
 
 UP = Upstream()
 
-# ---------- 上游连接池（每线程持久连接，复用 TLS 会话） ----------
+
+def _reload_snapshot() -> TargetSnapshot | None:
+    """纯读共享状态；损坏返回 None（不回写、不抛给请求路径）。"""
+    try:
+        return load_snapshot(STATE_FILE)
+    except StateFormatError:
+        return None
+
+
+# ---------- 上游连接（按目标身份分代复用，TLS fail-closed） ----------
 _thread_local = threading.local()
-_pool_lock = threading.Lock()
-_pool_version = 0  # 端口变化时递增，使旧连接失效
+_ctx_cache = {}
 
 
-def _connection_pool_reset():
-    """端口变化时调用，标记所有缓存连接失效"""
-    global _pool_version
-    with _pool_lock:
-        _pool_version += 1
+def _discover_client_cert() -> tuple[str | None, str | None]:
+    """受信 App 包内客户端证书本地发现（仅路径兜底；server_name 绝不由此学习）。"""
+    try:
+        for f in os.listdir(CERTS):
+            if f.endswith("_cert.pem"):
+                cert = os.path.join(CERTS, f)
+                key = os.path.join(CERTS, f.replace("_cert.pem", "_private_key.pem"))
+                if os.path.exists(key):
+                    return cert, key
+    except OSError:
+        pass
+    return None, None
 
 
-def _make_upstream_ctx():
-    """创建上游 TLS 上下文（跳过证书校验，用客户端证书双向认证）"""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    if os.path.exists(CERTS):
-        try:
-            for f in os.listdir(CERTS):
-                if f.endswith("_cert.pem"):
-                    cert = os.path.join(CERTS, f)
-                    key = os.path.join(CERTS, f.replace("_cert.pem", "_private_key.pem"))
-                    if os.path.exists(key):
-                        ctx.load_cert_chain(certfile=cert, keyfile=key)
-                        break
-            ca = os.path.join(CERTS, "ca_chain.pem")
-            if os.path.exists(ca):
-                ctx.load_verify_locations(cafile=ca)
-        except Exception:
-            pass
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+def _resolve_tls(t: TlsTarget) -> TlsConfig:
+    """env(MWDAV_TLS_*) 优先；其次发布配置；再用受信本地证书目录兜底。
+    server_name 只能来自 env/显式配置，缺失由 build_client_context fail-closed。"""
+    env = lambda n: os.environ.get(n) or None
+    ca = env("MWDAV_TLS_CA_FILE") or t.ca_file or os.path.join(CERTS, "ca_chain.pem")
+    ca = ca if os.path.isfile(ca) else None
+    cert = env("MWDAV_TLS_CERT_FILE") or t.cert_file
+    key = env("MWDAV_TLS_KEY_FILE") or t.key_file
+    if not (cert and key):
+        dc, dk = _discover_client_cert()
+        cert = cert or dc
+        key = key or dk
+    return TlsConfig(
+        ca_file=ca, cert_file=cert, key_file=key,
+        server_name=env("MWDAV_TLS_SERVER_NAME") or t.server_name)
 
 
-def _get_upstream_conn(host, port):
-    """获取当前线程的持久上游连接。
-    如果连接已失效（端口变化、连接断开），则新建连接。
-    连接复用避免了每次请求重复 TLS 握手，是大目录性能提升的关键。"""
-    conn = getattr(_thread_local, 'conn', None)
-    ver = getattr(_thread_local, 'version', -1)
-    saved_host = getattr(_thread_local, 'host', None)
-    saved_port = getattr(_thread_local, 'port', None)
+def _build_ctx(up: dict) -> ssl.SSLContext:
+    cfg = _resolve_tls(up["tls"])
+    key = (cfg.ca_file, cfg.cert_file, cfg.key_file, cfg.server_name)
+    if key not in _ctx_cache:
+        _ctx_cache[key] = build_client_context(cfg)  # fail closed
+    return _ctx_cache[key]
 
-    # 检查连接是否仍然有效
-    if (conn is not None and ver == _pool_version
-            and saved_host == host and saved_port == port):
-        try:
-            # 用 sock 状态快速判断连接是否还活着
-            if conn.sock is not None:
-                # 尝试设置非阻塞读取来检测连接是否已关闭
-                # 不实际发请求，避免额外开销
-                return conn
-        except Exception:
-            pass
-        # 连接可能已关闭，尝试关闭后重建
+
+def _close_tl_conn():
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
         try:
             conn.close()
         except Exception:
             pass
+    _thread_local.conn = None
 
-    # 新建连接
-    ctx = _make_upstream_ctx()
-    conn = http.client.HTTPSConnection(host, port, timeout=UPSTREAM_TIMEOUT, context=ctx)
-    _thread_local.conn = conn
-    _thread_local.version = _pool_version
-    _thread_local.host = host
-    _thread_local.port = port
+
+class _ServerNameHTTPSConnection(http.client.HTTPSConnection):
+    """以显式受信 server_name 做 SNI 与主机名校验；不拿连接地址冒充身份。"""
+
+    def __init__(self, host, port, timeout, context, server_name):
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._server_name = server_name
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._server_name)
+        self.sock.settimeout(self.timeout)
+
+
+def _obtain_conn(up: dict, force_new: bool = False) -> http.client.HTTPSConnection:
+    tl = _thread_local
+    if (not force_new and getattr(tl, "conn", None) is not None
+            and getattr(tl, "gen", -1) == up["generation"]
+            and getattr(tl, "host", None) == up["host"]
+            and getattr(tl, "port", None) == up["port"]):
+        return tl.conn
+    _close_tl_conn()
+    cfg = _resolve_tls(up["tls"])
+    ctx = _build_ctx(up)
+    conn = _ServerNameHTTPSConnection(
+        up["host"], up["port"], UPSTREAM_TIMEOUT, ctx, cfg.server_name)
+    tl.conn, tl.gen, tl.host, tl.port = conn, up["generation"], up["host"], up["port"]
     return conn
 
 
-# ---------- 上游并发限制（信号量） ----------
+def _connection_pool_reset():
+    """仅在目标身份实际变化时由读路径调用；关闭线程本地旧连接。"""
+    _close_tl_conn()
+
+
+# 同时限制“进入请求处理并可能读取请求体”的数量，以及实际上游并发。
+# 前者必须在读取请求体前获取，防止大量 200MiB 请求先堆入内存再排队等上游槽位。
+_request_semaphore = threading.Semaphore(MAX_CONCURRENT_UPSTREAM)
 _upstream_semaphore = threading.Semaphore(MAX_CONCURRENT_UPSTREAM)
 
 
-def _send_upstream(method, path, headers, body):
-    """转发单个请求到上游 WebDAV，返回 (status, resp_headers, body_bytes)。
-    使用持久连接复用 + 并发限制 + 缩短超时。"""
-    _load_shared_state()
-    up = UP.snapshot()
-    conn = _get_upstream_conn(up["host"], up["port"])
-
-    # 构造请求头
-    out_headers = {}
-    skip = {"host", "content-length", "connection", "accept-encoding", "transfer-encoding"}
-    for k, v in headers.items():
-        if k.lower() in skip:
-            continue
-        out_headers[k] = v
-    # 注入认证
-    creds = f'{up["username"]}:{up["password"]}'
-    out_headers["Authorization"] = "Basic " + base64.b64encode(creds.encode()).decode()
-
-    # 转换 Destination 头（MOVE/COPY 请求）：把本地代理地址替换成上游地址 + base
-    # Finder 发的 Destination 是 http://127.0.0.1:18445/路径/，NAS 期望 https://上游:端口/pool0/data/路径/
-    # 不转换的话 NAS 返回 400，导致 Finder 提示"请尝试使用字符较少，或不含标点符号的名称"
-    dest_key = None
-    for k in out_headers:
-        if k.lower() == "destination":
-            dest_key = k
+def _read_bounded(resp) -> bytes:
+    chunks, total = [], 0
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
             break
-    if dest_key:
-        dest = out_headers[dest_key]
-        try:
-            parsed = urllib.parse.urlparse(dest)
-            # 重新构造上游 URL：https://host:port + base + path
-            upstream_dest = f"https://{up['host']}:{up['port']}{up['base']}{parsed.path}"
-            if parsed.query:
-                upstream_dest += "?" + parsed.query
-            if parsed.fragment:
-                upstream_dest += "#" + parsed.fragment
-            del out_headers[dest_key]
-            out_headers["Destination"] = upstream_dest
-        except Exception:
-            pass
+        total += len(chunk)
+        if total > MAX_RESPONSE_BODY:
+            raise ResponseTooLarge()
+        chunks.append(chunk)
+    return b"".join(chunks)
 
-    # 路径：代理根路径 -> 上游 base
-    if path == "/" or path == "":
-        full = up["base"] + "/"
-    else:
-        full = up["base"] + (path if path.startswith("/") else "/" + path)
-    full = urllib.parse.quote(full, safe="/:%@!$&'()*+,;=-._~[]%")
+
+def _build_out_headers(up: dict, headers: dict) -> dict:
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in HOP_BY_HOP or k.lower() == "authorization":
+            continue
+        out[k] = v
+    creds = f'{up["username"]}:{up["password"]}'
+    out["Authorization"] = "Basic " + base64.b64encode(creds.encode()).decode()
+    return out
+
+
+def _rewrite_destination(up: dict, dest: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(dest)
+        upstream = f"https://{up['host']}:{up['port']}{up['base']}{parsed.path}"
+        if parsed.query:
+            upstream += "?" + parsed.query
+        return upstream
+    except Exception:
+        return dest
+
+
+def _send_once(up: dict, method: str, full: str, headers: dict, body):
+    conn = _obtain_conn(up)
+    conn.request(method, full, body=body, headers=headers)
+    resp = conn.getresponse()
+    data = _read_bounded(resp)
+    return resp.status, dict(resp.getheaders()), data
+
+
+def _build_upstream_path(base: str, request_target: str) -> str:
+    """仅编码 URI path，保留 query 分隔符和已编码序列；fragment 不应出现在 HTTP request-target。"""
+    parts = urllib.parse.urlsplit(request_target)
+    raw_path = parts.path if parts.path.startswith("/") else "/" + parts.path
+    full = base.rstrip("/") + raw_path
+    quoted = urllib.parse.quote(full, safe="/:%@!$&'()*+,;=-._~[]%")
+    return quoted + (("?" + parts.query) if parts.query else "")
+
+
+def _send_upstream(method, path, headers, body):
+    """转发；安全方法连接级失败可在重读最新快照后重试一次；
+    不安全方法不确定提交结果直接抛 UnknownCommitError，绝不盲重放。"""
+    if UP.lockout.locked():
+        status = UP.lockout.status()
+        raise TlsHandshakeError(
+            "TLS 暂时闭锁（%.1fs 后重试）：%s" % (
+                status["retry_after"], status["last_diagnostic"] or "连续握手失败"))
+    up = UP.snapshot()
+    full = _build_upstream_path(up["base"], path)
+    out_headers = _build_out_headers(up, headers)
+
+    dest_key = next((k for k in out_headers if k.lower() == "destination"), None)
+    if dest_key:
+        out_headers[dest_key] = _rewrite_destination(up, out_headers[dest_key])
 
     acquired = False
     try:
-        # 并发限制：避免 Finder 大目录同时发几百个请求打爆上游
         _upstream_semaphore.acquire()
         acquired = True
-
         try:
-            conn.request(method, full, body=body, headers=out_headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            hdrs = {k: v for k, v in resp.getheaders()}
-            return resp.status, hdrs, data
-        except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError, OSError):
-            # 连接失效（上游端口变化、隧道抖动），关闭旧连接，重试一次
-            try:
-                conn.close()
-            except Exception:
-                pass
-            _thread_local.conn = None
-            conn = _get_upstream_conn(up["host"], up["port"])
-            conn.request(method, full, body=body, headers=out_headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            hdrs = {k: v for k, v in resp.getheaders()}
-            return resp.status, hdrs, data
-    except Exception as e:
-        # 请求失败，标记连接失效（下次重建）
-        try:
-            conn.close()
-        except Exception:
-            pass
-        _thread_local.conn = None
-        raise
+            return _send_once(up, method, full, out_headers, body)
+        except UnknownCommitError:
+            raise
+        except TlsError as e:
+            UP.lockout.record_failure(e)
+            _close_tl_conn()
+            raise
+        except ssl.SSLError as e:
+            # wrap_socket/http.client 抛原生 SSL 异常；统一分类后再进入闭锁，
+            # 防止证书校验失败落入通用网络重试而绕过安全策略。
+            err = UP.lockout.record_failure(e)
+            _close_tl_conn()
+            raise err from e
+        except ResponseTooLarge:
+            _close_tl_conn()
+            raise
+        except Exception as e:
+            _close_tl_conn()
+            if method not in SAFE_METHODS:
+                # 保守策略：不安全方法的任意传输失败（含发送前连接失败）都按"提交结果
+                # 不确定"处理，不区分 connect/send 阶段；宁可让客户端显式复查，也不冒
+                # 双写/双删风险（spec 允许发送前重试，此处选择更安全的不重放）。
+                raise UnknownCommitError(
+                    f"{method} 上游失败且提交结果不确定，禁止自动重放：{type(e).__name__}") from e
+            # 安全方法：重读最新快照，重建身份后重试一次
+            snap = _reload_snapshot()
+            if snap is not None:
+                UP.adopt(snap)
+                up = UP.snapshot()
+                full = _build_upstream_path(up["base"], path)
+                out_headers = _build_out_headers(up, headers)
+                dk = next((k for k in out_headers if k.lower() == "destination"), None)
+                if dk:
+                    out_headers[dk] = _rewrite_destination(up, out_headers[dk])
+                return _send_once(up, method, full, out_headers, body)
+            raise
     finally:
         if acquired:
             _upstream_semaphore.release()
 
-# ---------- PROPFIND 响应缓存 ----------
+
+# ---------- PROPFIND 缓存（键含 Depth、命名空间无关、硬上限、双端失效） ----------
 _propfind_cache = {}
-_propfind_cache_lock = threading.Lock()
+_propfind_lock = threading.Lock()
 
 
-def _get_propfind_cache(path):
-    """获取 PROPFIND 响应缓存（未过期则返回）"""
-    with _propfind_cache_lock:
-        entry = _propfind_cache.get(path)
+def _norm_path(p: str) -> str:
+    parsed = urllib.parse.urlsplit(p)
+    path = urllib.parse.unquote(parsed.path)
+    path = re.sub(r"/+", "/", path)
+    if path != "/":
+        path = path.rstrip("/")
+    return path or "/"
+
+
+def _norm_depth(h: str | None) -> str:
+    d = (h or "").strip().lower()
+    if d == "0":
+        return "0"
+    if d == "1":
+        return "1"
+    return "inf"
+
+
+def _propfind_cache_key(path: str, depth: str, generation: int, body: bytes | None) -> tuple:
+    """缓存键：归一化路径 + Depth + 目标代次/身份 + PROPFIND 请求体摘要。
+    不同属性查询、目标轮换、不同 Depth 互不串用。"""
+    digest = hashlib.sha256(body or b"").hexdigest()[:16]
+    return (path, depth, generation, digest)
+
+
+def _cache_get(key: tuple):
+    with _propfind_lock:
+        entry = _propfind_cache.get(key)
         if entry and time.time() - entry[0] < PROPFIND_CACHE_TTL:
             return entry[1]
-        return None
+    return None
 
 
-def _set_propfind_cache(path, data):
-    """设置 PROPFIND 响应缓存，并清理过期条目"""
-    with _propfind_cache_lock:
-        _propfind_cache[path] = (time.time(), data)
-        # 缓存过大时清理过期条目
-        if len(_propfind_cache) > PROPFIND_CACHE_MAX_ENTRIES:
-            now = time.time()
-            expired = [k for k, v in _propfind_cache.items() if now - v[0] >= PROPFIND_CACHE_TTL]
-            for k in expired:
-                del _propfind_cache[k]
+def _cache_set(key: tuple, data: bytes):
+    with _propfind_lock:
+        _propfind_cache[key] = (time.time(), data)
+        while len(_propfind_cache) > PROPFIND_CACHE_MAX_ENTRIES:
+            oldest = min(_propfind_cache, key=lambda k: _propfind_cache[k][0])
+            del _propfind_cache[oldest]
 
 
-def _invalidate_propfind_cache(path):
-    """修改操作后，清除相关路径的 PROPFIND 缓存（自身及父目录）"""
-    with _propfind_cache_lock:
-        keys = list(_propfind_cache.keys())
-        # 归一化路径：去尾斜杠
-        norm = path.rstrip("/")
-        for k in keys:
-            kn = k.rstrip("/")
-            # 清除：自身、父目录（目录内容变化后父目录列表也可能变化）
+def _invalidate_tree(norm: str):
+    with _propfind_lock:
+        for k in list(_propfind_cache):
+            kn = k[0]
             if kn == norm or norm.startswith(kn + "/") or kn.startswith(norm + "/"):
                 del _propfind_cache[k]
 
-# ---------- PROPFIND 响应净化（解决"母文件夹出现在子文件夹中"） ----------
+
 _RESP_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?response>.*?</(?:[A-Za-z_][\w.-]*:)?response>", re.S)
 _HREF_RE = re.compile(r"<(?:[A-Za-z_][\w.-]*:)?href>\s*([^<]+?)\s*</(?:[A-Za-z_][\w.-]*:)?href>")
 
 
-def _norm_href(href):
-    """href 归一化：去掉 base 前缀与转义，返回去尾斜杠的相对路径"""
+def _norm_href(href: str) -> str:
     href = href.strip()
-    if href.startswith("http://") or href.startswith("https://"):
+    if href.startswith(("http://", "https://")):
         try:
             href = urllib.parse.urlsplit(href).path
         except Exception:
@@ -378,16 +462,13 @@ def _norm_href(href):
     return href.strip("/")
 
 
-def _strip_self_entry(body, req_path):
-    """移除 multistatus 中「目录自身」的 response。
-    macOS 的 WebDAV 客户端会把 PROPFIND 响应里的自引用条目渲染成可见子目录。"""
+def _strip_self_entry(body: bytes, req_path: str) -> bytes:
     target = _norm_href(req_path)
     text = body.decode("utf-8", "replace")
     blocks = list(_RESP_RE.finditer(text))
     if len(blocks) <= 1:
         return body
-    kept = []
-    changed = False
+    kept, changed = [], False
     for m in blocks:
         block = m.group(0)
         hm = _HREF_RE.search(block)
@@ -397,61 +478,173 @@ def _strip_self_entry(body, req_path):
         kept.append(block)
     if not changed:
         return body
-    head = text[:blocks[0].start()]
-    tail = text[blocks[-1].end():]
+    head, tail = text[:blocks[0].start()], text[blocks[-1].end():]
     return (head + "".join(kept) + tail).encode("utf-8")
+
+
+def _count_responses(data: bytes) -> int:
+    """命名空间无关地统计 DAV:response 条数；解析失败返回 -1（不缓存）。"""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return -1
+    n = 0
+    for el in root.iter():
+        if el.tag.split("}")[-1] == "response":
+            n += 1
+    return n
+
 
 # ---------- 本地 HTTP 服务器 ----------
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        # 记录请求日志，用于调试
         try:
             print(f"[PROXY] {self.address_string()} - {fmt % args}", flush=True)
         except Exception:
             pass
 
-    def _send_simple(self, status, body=b"", content_type="text/plain; charset=utf-8"):
-        """快速发送简单响应（用于元数据 404、错误等）"""
+    def _send_simple(self, status, body=b"", content_type="text/plain; charset=utf-8",
+                     close=False, extra_headers=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD" and body:
             self.wfile.write(body)
 
-    def _handle(self):
-        _load_shared_state()
+    def _drain_bounded(self, cap: int = 256 * 1024):
+        """拒绝后受限排空声明体（配合 Connection: close），最多读 cap 字节，
+        避免未消费体残留；读不动即放弃，不阻塞。"""
+        try:
+            remaining = cap
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, ConnectionError):
+            pass
 
-        # 1. 安全读取请求体（容错：异常 Content-Length / 客户端断开）
+    # ---- 入站认证（始终 require，无开关） ----
+    def _authorized(self) -> bool:
+        up = UP.snapshot()
+        if not (up["username"] and up["password"]):
+            return False
+        auth = self.headers.get("Authorization", "") or ""
+        if not auth.startswith("Basic "):
+            return False
+        try:
+            dec = base64.b64decode(auth[6:]).decode("utf-8", "replace")
+        except Exception:
+            return False
+        u, _, p = dec.partition(":")
+        return hmac.compare_digest(u, up["username"]) and hmac.compare_digest(p, up["password"])
+
+    def handle_expect_100(self):
+        """在发送 100 Continue 前执行可判定门禁，避免鼓励未认证/超限客户端发送大体。"""
+        up = UP.snapshot()
+        if not (up["port"] and up["username"] and up["password"]):
+            self._send_simple(503, "代理目标尚未配置：等待上游 WebDAV 目标发布。".encode(),
+                              close=True)
+            return False
+        if not self._authorized():
+            self._send_simple(401, b"Unauthorized",
+                              extra_headers={"WWW-Authenticate": 'Basic realm="MiNAS"'},
+                              close=True)
+            return False
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te and self.command in WRITE_METHODS:
+            self._send_simple(501, "暂不支持 chunked 上传，请使用 Content-Length。".encode(),
+                              close=True)
+            return False
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            if length < 0 or length > MAX_BODY_SIZE:
-                length = 0
-            body = self.rfile.read(length) if length else None
-        except (OSError, ValueError, ConnectionError):
-            body = None
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0:
+            self._send_simple(400, "非法 Content-Length。".encode(), close=True)
+            return False
+        if length > MAX_REQUEST_BODY:
+            self._send_simple(413, "请求体超过上限，已拒绝且未转发上游。".encode(),
+                              close=True)
+            return False
+        return super().handle_expect_100()
 
-        # 2. 入站认证已移除：代理只监听 127.0.0.1，仅本机可访问；
-        #    状态文件 600 权限仅当前用户可读；上游连接使用客户端证书认证。
-        #    macOS 新版 NetFS 不再自动传递 Basic 凭证，保留认证会导致挂载失败。
+    def _handle(self):
+        # 1. 纯读采纳最新目标（零写副作用，代理自身不发布）
+        snap = _reload_snapshot()
+        if snap is not None and UP.adopt(snap):
+            _connection_pool_reset()
+        up = UP.snapshot()
 
-        # 3. Finder 元数据请求快速响应（不转发上游，直接 404）
-        #    这是大目录性能提升的关键：Finder 对每个文件请求 ._文件名 等，
-        #    大目录几百个文件就是几百个无效上游往返。
+        # 2. 目标未配齐 → 503。未配置时不存在可用于比较的入站凭证，
+        # 必须先报告配置未就绪，而不是把所有请求误报成认证失败。
+        if not (up["port"] and up["username"] and up["password"]):
+            self._send_simple(503, "代理目标尚未配置：等待上游 WebDAV 目标发布。".encode(),
+                              close=True)
+            return
+
+        # 3. 入站认证：缺失/不匹配 → 401 挑战
+        if not self._authorized():
+            self._send_simple(
+                401, b"Unauthorized",
+                extra_headers={"WWW-Authenticate": 'Basic realm="MiNAS"'},
+                close=True)
+            # close=True 后直接返回，不按字节界排空声明体（无时间界/不按
+            # Content-Length 收尾会在客户端不 EOF 时 stall）；沿 Expect/401 模式。
+            return
+
+        # 4. Finder 元数据快速 404
         if _is_meta_request(self.path):
             self._send_simple(404)
             return
 
-        # 4. PROPFIND 缓存查询（大目录短时间内重复请求直接返回缓存）
-        is_propfind = (self.command == "PROPFIND")
+        # 5. 请求体策略：chunked 显式拒绝；超限 413；短读中止，禁止空体转发
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te and self.command in WRITE_METHODS:
+            self._send_simple(501, "暂不支持 chunked 上传，请使用 Content-Length。".encode(),
+                              close=True)
+            self._drain_bounded()
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = -1
+        if length < 0:
+            self._send_simple(400, "非法 Content-Length。".encode(), close=True)
+            return
+        if length > MAX_REQUEST_BODY:
+            self._send_simple(
+                413, "请求体超过上限，已拒绝且未转发上游。".encode(), close=True)
+            self._drain_bounded()
+            return
+        body = None
+        if length:
+            try:
+                body = self.rfile.read(length)
+            except (OSError, ConnectionError):
+                body = None
+            if not body or len(body) != length:
+                self._send_simple(400, "请求体不完整，未转发上游。".encode(), close=True)
+                return
+
+        # 6. PROPFIND 缓存（键 = 归一化路径 + Depth + 目标代次 + 请求体摘要）
+        is_propfind = self.command == "PROPFIND"
+        cache_key = None
         cached = None
         if is_propfind:
-            cached = _get_propfind_cache(self.path)
-
+            cache_key = _propfind_cache_key(
+                _norm_path(self.path), _norm_depth(self.headers.get("Depth")),
+                up["generation"], body)
+            cached = _cache_get(cache_key)
         if cached is not None:
-            # 命中缓存，直接返回（已剥离自引用条目）
             self.send_response(207)
             self.send_header("Content-Type", "application/xml; charset=utf-8")
             self.send_header("Content-Length", str(len(cached)))
@@ -460,111 +653,178 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(cached)
             return
 
-        # 5. 转发到上游
+        # 7. 转发
         try:
             status, hdrs, data = _send_upstream(
                 self.command, self.path,
-                {k: v for k, v in self.headers.items()}, body
-            )
-
-            # 6. PROPFIND 列表响应：剥离自引用条目 + 写入缓存
-            if is_propfind and data:
-                ctype = (hdrs.get("Content-Type") or "").lower()
-                if "xml" in ctype:
-                    data = _strip_self_entry(data, self.path)
-                    # 只缓存多条目响应（目录列表），不缓存单条目（Depth:0）
-                    if data.count(b"<response") > 1:
-                        _set_propfind_cache(self.path, data)
-
-            # 7. 修改操作后使 PROPFIND 缓存失效
-            if self.command in ("PUT", "DELETE", "MKCOL", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK"):
-                _invalidate_propfind_cache(self.path)
-
-            # 8. 回传响应
-            self.send_response(status)
-            for k, v in hdrs.items():
-                # 跳过 Python 已自动添加的头，以及需要特殊处理的头
-                if k.lower() in ("content-length", "transfer-encoding", "connection", "server", "date"):
-                    continue
-                self.send_header(k, v)
-            # OPTIONS 响应添加 WWW-Authenticate 头，告诉客户端需要 Basic 认证
-            if self.command == "OPTIONS":
-                self.send_header("WWW-Authenticate", 'Basic realm="MiNAS"')
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(data)
-
+                {k: v for k, v in self.headers.items()}, body)
+        except UnknownCommitError as e:
+            UP.set_health(connected=False, error=str(e))
+            self._send_simple(502, f"上游提交结果不确定，未自动重发：{e}".encode(), close=True)
+            return
+        except TlsError as e:
+            UP.set_health(connected=False, error=e.diagnostic)
+            self._send_simple(
+                502, f"TLS 上游不可用（{e.code}）：{e.diagnostic}".encode(), close=True)
+            return
+        except ResponseTooLarge:
+            UP.set_health(connected=False, error="响应超过内存上限")
+            self._send_simple(507, "上游响应超过内存上限，已中止。".encode(), close=True)
+            return
+        except StateFormatError as e:
+            UP.set_health(connected=False, error=str(e))
+            self._send_simple(503, f"共享状态损坏：{e}".encode(), close=True)
+            return
         except Exception as e:
-            UP.update(error=str(e))
-            self._send_simple(502,
-                ("代理无法连接 NAS WebDAV：%s\n请确认「小米智能存储」App 正在运行且设备在线。"
-                 % str(e)).encode("utf-8"))
+            UP.set_health(connected=False, error=f"{type(e).__name__}: {e}")
+            self._send_simple(
+                502, ("代理无法连接 NAS WebDAV：%s\n请确认「小米智能存储」App 正在运行且设备在线。"
+                      % e).encode(), close=True)
+            return
 
-    do_GET = _handle
-    do_HEAD = _handle
-    do_POST = _handle
-    do_PUT = _handle
-    do_DELETE = _handle
-    do_MKCOL = _handle
-    do_COPY = _handle
-    do_MOVE = _handle
-    do_PROPFIND = _handle
-    do_PROPPATCH = _handle
-    do_LOCK = _handle
-    do_UNLOCK = _handle
-    do_OPTIONS = _handle
+        UP.lockout.record_success()
+        UP.set_health(connected=True)
+
+        # 8. PROPFIND 列表：命名空间无关校验 + 剥离自引用 + 写缓存
+        if is_propfind and data and status == 207 and cache_key is not None:
+            ctype = (hdrs.get("Content-Type") or "").lower()
+            if "xml" in ctype and _count_responses(data) >= 2:
+                data = _strip_self_entry(data, self.path)
+                _cache_set(cache_key, data)
+
+        # 9. 修改操作失效缓存（MOVE/COPY 同时失效源与目标两端）
+        if self.command in ("DELETE", "MKCOL", "COPY", "MOVE", "PROPPATCH",
+                            "LOCK", "UNLOCK", "PUT"):
+            _invalidate_tree(_norm_path(self.path))
+            if self.command in ("MOVE", "COPY"):
+                dest = next((v for k, v in self.headers.items()
+                             if k.lower() == "destination"), None)
+                if dest:
+                    try:
+                        dp = urllib.parse.urlparse(dest).path
+                    except Exception:
+                        dp = dest
+                    _invalidate_tree(_norm_path(dp))
+
+        # 10. 回传响应（HEAD 原样透传上游头，含 Content-Length，不写体）
+        self.send_response(status)
+        for k, v in hdrs.items():
+            kl = k.lower()
+            if kl in HOP_BY_HOP:
+                # HEAD 保留上游 Content-Length；其余方法丢弃后由代理重算
+                if self.command != "HEAD" or kl != "content-length":
+                    continue
+            self.send_header(k, v)
+        if self.command == "OPTIONS":
+            self.send_header("WWW-Authenticate", 'Basic realm="MiNAS"')
+        if self.command != "HEAD":
+            self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD" and data:
+            self.wfile.write(data)
+
+    def _handle_guarded(self):
+        _request_semaphore.acquire()
+        try:
+            return self._handle()
+        finally:
+            _request_semaphore.release()
+
+    do_GET = _handle_guarded
+    do_HEAD = _handle_guarded
+    do_POST = _handle_guarded
+    do_PUT = _handle_guarded
+    do_DELETE = _handle_guarded
+    do_MKCOL = _handle_guarded
+    do_COPY = _handle_guarded
+    do_MOVE = _handle_guarded
+    do_PROPFIND = _handle_guarded
+    do_PROPPATCH = _handle_guarded
+    do_LOCK = _handle_guarded
+    do_UNLOCK = _handle_guarded
+    do_OPTIONS = _handle_guarded
 
 
 class ProxyServer:
-    def __init__(self, port=DEFAULT_LISTEN_PORT):
+    """可嵌入常驻 service 的本地 HTTP 代理服务（线程模型明确、可重复停止）。
+
+    - start()：绑定（0=临时端口）→ 起 serve_forever 线程；端口占用抛 OSError
+      （EADDRINUSE），不留半成品；返回实际监听端口。
+    - stop(timeout)：shutdown → server_close → join 线程，可重复调用，清理套接字。
+    - 自身不做发现/自愈、不发布目标：由嵌入的 service 持续读快照并 adopt。
+    """
+
+    def __init__(self, port: int = DEFAULT_LISTEN_PORT, enable_https: bool = False):
         self.port = port
+        self._enable_https = enable_https
         self.httpd = None
         self.httpsd = None
         self.thread = None
         self.https_thread = None
-        self._https = False
 
-    def start(self):
-        # 设置 TCP keepalive 和 backlog，改善高并发下的连接处理
+    @property
+    def listen_port(self) -> int | None:
+        return self.httpd.server_port if self.httpd else None
+
+    def start(self) -> int:
         http.server.ThreadingHTTPServer.request_queue_size = 64
-
-        # HTTP 服务器（主端口，用于 Finder 挂载）
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        # 先清理前次实例，防止重复 start 泄漏套接字/线程。
+        self.stop()
+        try:
+            self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        except OSError:
+            self.httpd = None
+            raise
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True, name="mwdav-http")
         self.thread.start()
 
-        # HTTPS 服务器（主端口+1，可选，用于需要加密的场景）
-        cert_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "localhost.crt")
-        key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "localhost.key")
-        if os.path.exists(cert_file) and os.path.exists(key_file):
-            try:
-                https_port = self.port + 1
-                self.httpsd = http.server.ThreadingHTTPServer(("127.0.0.1", https_port), Handler)
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-                self.httpsd.socket = ctx.wrap_socket(self.httpsd.socket, server_side=True)
-                self.https_thread = threading.Thread(target=self.httpsd.serve_forever, daemon=True)
-                self.https_thread.start()
-                self._https = True
-            except Exception as e:
-                print(f"HTTPS 启用失败: {e}")
-                self._https = False
+        if self._enable_https:
+            cert_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "localhost.crt")
+            key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "localhost.key")
+            if os.path.exists(cert_file) and os.path.exists(key_file):
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                    self.httpsd = http.server.ThreadingHTTPServer(
+                        ("127.0.0.1", self.port + 1), Handler)
+                    self.httpsd.socket = ctx.wrap_socket(
+                        self.httpsd.socket, server_side=True)
+                    self.https_thread = threading.Thread(
+                        target=self.httpsd.serve_forever, daemon=True,
+                        name="mwdav-https")
+                    self.https_thread.start()
+                except Exception as e:
+                    # HTTPS 旁路失败不阻断 HTTP 主面；记录并降级为仅 HTTP。
+                    self.httpsd = None
+                    self.https_thread = None
+                    print(f"HTTPS 启用失败: {e}")
+        return self.listen_port
 
-        return True
+    def stop(self, timeout: float = 5.0) -> None:
+        for srv, thr in ((self.httpd, self.thread),
+                         (self.httpsd, self.https_thread)):
+            if srv is not None:
+                try:
+                    srv.shutdown()
+                except Exception:
+                    pass
+                try:
+                    srv.server_close()
+                except Exception:
+                    pass
+            if thr is not None:
+                thr.join(timeout)
+        self.httpd = None
+        self.httpsd = None
+        self.thread = None
+        self.https_thread = None
 
-    def stop(self):
-        if self.httpd:
-            self.httpd.shutdown()
-            self.httpd.server_close()
-            self.httpd = None
-        if self.httpsd:
-            self.httpsd.shutdown()
-            self.httpsd.server_close()
-            self.httpsd = None
-
-    def is_running(self):
-        return self.httpd is not None
+    def is_running(self) -> bool:
+        return self.httpd is not None and self.thread is not None \
+            and self.thread.is_alive()
 
 
 def is_port_in_use(port):
@@ -577,18 +837,41 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=DEFAULT_LISTEN_PORT)
-    ap.add_argument("--upstream", type=int, default=DEFAULT_UPSTREAM_PORT)
-    ap.add_argument("--username", default="")
-    ap.add_argument("--password", default="")
+    ap.add_argument("--upstream", type=int, default=None)
+    ap.add_argument("--host", default=None)
+    ap.add_argument("--base", default=None)
+    ap.add_argument("--ca", default=None)
+    ap.add_argument("--cert", default=None)
+    ap.add_argument("--key", default=None)
+    ap.add_argument("--server-name", default=None)
+    ap.add_argument("--max-request-bytes", type=int, default=MAX_REQUEST_BODY)
+    ap.add_argument("--max-response-bytes", type=int, default=MAX_RESPONSE_BODY)
     args = ap.parse_args()
-    UP.update(port=args.upstream, username=args.username or None,
-              password=(args.password if args.password else None))
+
+    MAX_REQUEST_BODY = args.max_request_bytes
+    MAX_RESPONSE_BODY = args.max_response_bytes
+    snap = load_snapshot(STATE_FILE)
+    if snap is None:
+        ap.error("目标状态尚未发布；独立代理必须从受保护状态文件读取凭证")
+    UP.adopt(snap)
+    # CLI 只有显式传入时才覆盖非敏感位置/TLS；凭证只来自 0600 状态文件。
+    if any(v is not None for v in (args.host, args.upstream, args.base,
+                                    args.ca, args.cert, args.key, args.server_name)):
+        tls = TlsTarget(
+            ca_file=args.ca or snap.tls.ca_file,
+            cert_file=args.cert or snap.tls.cert_file,
+            key_file=args.key or snap.tls.key_file,
+            server_name=args.server_name or snap.tls.server_name)
+        UP.adopt(TargetSnapshot(
+            generation=snap.generation, published_at=snap.published_at,
+            host=args.host or snap.host,
+            port=args.upstream if args.upstream is not None else snap.port,
+            base=args.base or snap.base,
+            username=snap.username, password=snap.password, tls=tls))
+    effective = UP.snapshot()
     srv = ProxyServer(args.port)
     srv.start()
-    print(f"代理已启动(v2优化版): http://127.0.0.1:{args.port}  ->  https://127.0.0.1:{args.upstream}{UPSTREAM_BASE}")
-    if srv._https:
-        print(f"  HTTPS 可选端口: https://127.0.0.1:{args.port + 1}")
-    print(f"  连接复用: 每线程持久连接 | 并发限制: {MAX_CONCURRENT_UPSTREAM} | 超时: {UPSTREAM_TIMEOUT}s | PROPFIND缓存: {PROPFIND_CACHE_TTL}s")
+    print(f"代理已启动(硬化版): http://127.0.0.1:{args.port} -> https://{effective['host']}:{effective['port']}{effective['base']}")
     try:
         while True:
             time.sleep(3600)

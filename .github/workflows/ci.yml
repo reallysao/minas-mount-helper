@@ -1,0 +1,39 @@
+name: offline-tests
+
+# CI 只运行 tests/ 下的离线安全脚本：不连真实 NAS、不挂载、不使用真实凭证，
+# 不调用仓库根目录的历史人工探针（probe_ports.py / test_*.py）。
+on:
+  push:
+    branches: [fix/sdd-webdav-hardening, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    # 显式隔离：不注入任何凭证环境变量，禁止出站到真实设备。
+    environment: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 离线测试（仅 tests/，无网络/无挂载/无真实凭证）
+        env:
+          MINAS_TEST_OFFLINE: "1"
+        run: python3 tests/run_tests.py -v
+
+      - name: 守卫：根目录历史探针在 CI 环境必须拒绝执行
+        run: |
+          set -e
+          for f in probe_ports.py test_finder_full.py test_host_header.py \
+                   test_pool_info.py test_propfind.py test_sni.py test_webdav_auth.py; do
+            if [ -f "$f" ]; then
+              if python3 "$f" >/dev/null 2>&1; then
+                echo "::error::$f 在无 opt-in 时竟然执行成功，必须默认拒绝"
+                exit 1
+              fi
+            fi
+          done

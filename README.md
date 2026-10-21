@@ -12,8 +12,9 @@
 - ✅ 登录时自动启动、连接后自动挂载
 - ✅ 存储空间用量实时显示
 - ✅ 大目录性能优化（连接复用、元数据快速响应、PROPFIND 缓存）
-- ✅ 大目录性能优化（连接复用、元数据快速响应、PROPFIND 缓存）
-- ✅ 文件夹同步（v1.4）：多计划把桌面/文稿/下载等同步到 NAS「我的文档」，镜像/备份模式、可选传完删除本机文件、iCloud 文件自动下载保护、进度条、完成通知
+
+> 说明：`mountapp/sync_engine.py`（同步模块）当前**未被主程序加载**，本版本入口不提供同步面板，
+> 该能力未接入，勿当作已可用功能。
 
 ## 工作原理
 
@@ -30,13 +31,16 @@
 
 - 复用官方 App 已建立的 P2P 隧道（`sso_login` 进程）
 - WebDAV 凭证从官方 App 的本地缓存（LevelDB）自动提取
-- 本地代理是独立进程，App 退出/重启后已挂载的卷不受影响
+- 常驻服务内嵌代理（`main.py --service` 前台 `serve()`，无独立代理子进程）；服务是唯一配置发布者，
+  持续发现/跟随/A→B 二次发布/自愈。无参 `main.py` 是连接该服务的受保护 Unix socket IPC 客户端；
+  `stop` 命令或 SIGTERM 幂等关停。Linux/loopback 自动验收通过；macOS LaunchAgent 保活与 Finder/NetFS
+  实机为 B 层未测。
 
 ## 系统要求
 
 - macOS 11.0+
 - 已安装并登录官方「小米智能存储」App（必须，隧道依赖它）
-- Python 3.9+（运行时自动选择支持 Ed25519 的解释器）
+- Python 3.10+（代码使用 PEP 604 `str | None` 联合标注；运行时另自动选择支持 Ed25519 的解释器）
 
 ## 安装
 
@@ -67,29 +71,48 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 
 ## 安全说明
 
-### 数据传输安全
+> 本分支处于 SDD 加固阶段，以下区分「已成立的事实」与「目标要求/待实机验证」，
+> 完整威胁模型见 `docs/security/threat-model.md`，规格见 `docs/sdd/requirements.md`。
 
-- NAS ↔ Mac 全程 TLS 加密（P2P 隧道 + HTTPS）
-- 客户端证书（Ed25519）双向认证，确保连接的是真正的 NAS
-- 公司网络只能看到加密流量，看不到文件内容
+### 数据传输
+
+- 流量经官方 P2P 隧道 + HTTPS，公司网络只能看到加密流量，看不到文件内容。
+- **客户端证书 ≠ 服务器验证**：携带官方 App 客户端证书不等于校验了对端身份，
+  "双向认证确保连接的是真正 NAS" 这一说法不成立。服务端身份校验是独立事项：
+  代码已落地 `CERT_REQUIRED` + 主机名校验、`server_name` 取自显式受信配置
+  （env `MWDAV_TLS_SERVER_NAME` 优先）、缺失 fail-closed（SR-3，A 层离线握手覆盖）；
+  真实设备证书链/身份的实机握手仍属 B 层未验。
 
 ### 访问控制
 
-- 代理只监听 `127.0.0.1`（本机回环），不对外开任何端口
-- 代理强制入站 Basic 认证，无凭证请求一律 401
-- 含密码的状态文件权限 `600`，目录权限 `700`
-- 官方 App 客户端私钥权限 `600`
+- 代理只监听 `127.0.0.1`（本机回环），不对外开端口；但**回环不等于信任**，
+  绑定回环本身不能隔离同机其他用户/进程。
+- 入站恒为 require/fail-closed（代码已落地，A 层契约覆盖）：缺/错凭证 401、目标未配齐 503，
+  绝不匿名转发（SR-1）；NetFS 是否携带凭证属 B-7 实机兼容项，失败记兼容性问题，不以匿名绕过。
+- 含密码的状态文件目标权限 600、目录 700；官方 App 客户端私钥应收紧为 600。
 
 ### 在公司电脑上使用
 
 | 威胁场景 | 状态 |
 |---|---|
-| 公司局域网其他电脑扫描/访问 | ✅ 安全，代理只监听回环 |
-| 同机其他用户账户 | ✅ 已加固，凭证文件 600 权限 |
+| 公司局域网其他电脑扫描/访问 | ✅ 代理只监听回环，外部无法直连 |
+| 同机其他用户账户/进程 | ⚠️ 入站恒认证已落地（A 层覆盖），NetFS 兼容与隔离效果属 B-7 实机项，未验前不宣称"完全不可访问" |
 | 同事使用你已解锁的电脑 | ⚠️ 可访问，离开前务必锁屏（⌃⌘Q） |
 | 公司 IT 管理员（MDM/管理员权限） | ⚠️ 理论上可读，管理员本就可访问该电脑一切内容 |
 
 **建议**：敏感个人文件尽量不长期存放在公司设备可访问的位置；离开工位锁屏；不用时在应用里点「卸载」。
+
+## 本版本限制（务必阅读）
+
+- **上传请求体上限 200MiB**：超过 `MAX_REQUEST_BODY` 的 PUT 返回 `413`，不空体转发、连接关闭。
+- **下载响应体上限 64MiB**：`MAX_RESPONSE_BODY` 硬限，上游响应超限即中止并 `507`、关闭上游连接；
+  v1 不做流式 spool/背压，超大文件下载明确失败而非静默截断。
+- **拒绝 chunked 写方法**：`Transfer-Encoding: chunked` 的写请求返回 `501`（v1 不做流式解码）。
+- **挂载助手已按 v2 stdin 协议受控重建**：macOS CI 使用 Apple SDK 编译 arm64+x86_64 Universal Mach-O，
+  校验 0755 与 `MWDAV_MOUNT_PROTOCOL=2`；凭证走 stdin、不进 argv。真实 Finder/NAS 挂载仍需 B 层实机验证。
+- **TLS 受信身份必须显式配置**：`tls_server_name` 必填（同时用于 SNI 与主机名校验），
+  `MWDAV_TLS_SERVER_NAME/CA_FILE/CERT_FILE/KEY_FILE` 环境变量优先；**无 `tls_verify=false`/`MWDAV_TLS_VERIFY` 跳过开关**，
+  缺失受信配置 fail-closed，不从对端证书或连接池自动学习身份。
 
 ## 已知限制
 
@@ -97,7 +120,16 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 - 隧道偶发瞬时抖动（几秒），稍后自动恢复
 - 移动端/远端设备需保持在线，NAS 关机则无法访问
 - 大目录首次加载可能较慢（WebDAV 协议特性），已做性能优化
+- GUI 窗口关闭只断开 IPC 客户端，常驻服务继续发现/跟随/自愈；macOS LaunchAgent 保活与 Finder/NetFS 实机为 B 层未测
+- 仓库内历史 `MiNAS-Mount-Helper-v1.4.zip` 为旧发布包，与当前 HEAD 源码存在漂移，
+  且含旧代码；**以 HEAD 源码为准**，本分支不改写历史 ZIP
 - 本应用为第三方工具，非小米官方出品
+
+## 开发与测试
+
+- 离线测试：`python3 tests/run_tests.py`（不连真实 NAS、不挂载、不用真实凭证）。
+- SDD 文档：`docs/`（主规格、设计、验收、traceability 矩阵、威胁模型）。
+- 根目录 `probe_ports.py`、`test_*.py` 是历史人工探针，默认拒绝执行，需 `--allow-live` + 环境凭证。
 
 ## 项目结构
 
@@ -105,15 +137,17 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 minas-mount-helper/
 ├── README.md                 # 本文件
 ├── 使用说明.md                # 详细使用说明与修复记录
-├── 界面预览.png               # 应用界面截图
+├── AGENTS.md / CONTRIBUTING.md  # 协作须知与贡献流程
+├── docs/                     # SDD 规格/设计/验收/矩阵/威胁模型
+│   ├── sdd/                  # requirements / architecture / acceptance / process / matrix
+│   ├── specs/                # proxy.md（数据面）、runtime.md（控制面）
+│   └── security/             # 威胁模型
+├── tests/                    # 离线自动化（run_tests.py 入口；CI 只跑这里）
+├── .github/workflows/        # CI（仅离线脚本）
 ├── mountapp/                 # 核心源码
-│   ├── main.py               # Tkinter 界面主程序
-│   ├── app_core.py           # 应用核心逻辑（连接管理、挂载自愈）
-│   ├── conn_manager.py       # 连接管理器（凭证提取、端口探测）
-│   ├── mwdav_proxy.py        # WebDAV 反向代理（性能优化版）
-│   ├── netfs_mount           # 编译好的 NetFS 挂载助手（x86_64）
-│   └── netfs_mount.m         # NetFS 挂载助手源码（Objective-C）
-└── tests/                    # 测试脚本（可选）
+├── probe_ports.py            # 历史人工探针（默认拒绝，需 --allow-live）
+├── test_*.py                 # 历史人工探针（默认拒绝，需 --allow-live）
+└── MiNAS-Mount-Helper-v1.4.zip  # 历史发布包（常规改动不改写，后续可受控重建）
 ```
 
 ## 免责声明
