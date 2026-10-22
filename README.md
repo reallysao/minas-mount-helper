@@ -40,7 +40,8 @@
 
 - macOS 11.0+
 - 已安装并登录官方「小米智能存储」App（必须，隧道依赖它）
-- Python 3.10+（代码使用 PEP 604 `str | None` 联合标注；运行时另自动选择支持 Ed25519 的解释器）
+- Python 3.10+：macOS 系统自带 python3 为 3.9，不满足；请用 Homebrew 安装：
+  `brew install python@3.11`（启动器会自动查找 Homebrew/系统里可用的 3.10+ 解释器）
 
 ## 安装
 
@@ -76,12 +77,14 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 
 ### 数据传输
 
-- 流量经官方 P2P 隧道 + HTTPS，公司网络只能看到加密流量，看不到文件内容。
+- 流量经官方 P2P 隧道 + HTTPS，外部网络只能看到加密流量，看不到文件内容。
 - **客户端证书 ≠ 服务器验证**：携带官方 App 客户端证书不等于校验了对端身份，
   "双向认证确保连接的是真正 NAS" 这一说法不成立。服务端身份校验是独立事项：
-  代码已落地 `CERT_REQUIRED` + 主机名校验、`server_name` 取自显式受信配置
-  （env `MWDAV_TLS_SERVER_NAME` 优先）、缺失 fail-closed（SR-3，A 层离线握手覆盖）；
-  真实设备证书链/身份的实机握手仍属 B 层未验。
+  代码已落地 `CERT_REQUIRED` + 主机名校验。`server_name` 优先取自显式配置
+  （env `MWDAV_TLS_SERVER_NAME` / config 的 `tls_server_name`）；未配置时自动从
+  本地隧道端口服务器证书读取 subject CN（仅限 127.0.0.1 回环身份探测，最终校验
+  仍是严格 CA 验证 + 主机名匹配，不存在绕过），因此**用户无需手工配置任何设备 ID**，
+  更换设备/重绑账号也能自适应。
 
 ### 访问控制
 
@@ -157,3 +160,12 @@ minas-mount-helper/
 ## 许可证
 
 MIT License
+
+## 修复记录（2026-10-22，通用化 + 挂载状态修复）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| 挂载实际成功但 App 显示未挂载/离线 | `parse_mount_table` 解析 WebDAV URL 源（`http://127.0.0.1:18445/`）时把 host 误解析成 `http`、port 解析成 `None`，导致挂载认领失败 | 挂载表解析支持 `scheme://host:port/path` 格式，正确提取 host/port |
+| 需手工配置 `tls_server_name`（设备 ID），换设备/换账号即失效 | 严格 TLS 要求显式服务器名，但设备 ID 因设备而异且官方 App 不提供配置入口 | 新增 `discover_server_name`：本地回环身份探测自动读取隧道证书 subject CN（`nas.*`）；未配置时自动获取，无需任何手工配置；仍保持 CERT_REQUIRED fail-closed |
+| 启动器依赖豆包沙箱 Python 路径，其他 Mac 无法运行 | launcher 优先查找 `~/Library/Application Support/Doubao/sandbox_runtime/...`（本机专属） | 重写启动器：Homebrew（Intel/Apple Silicon）→ PATH → 系统 查找链；GUI 单实例匹配精确化（不再误拦常驻服务） |
+| 代理 CA 兜底路径仅认标准安装位置 | 小米 App 若装在非标准位置则 CA 缺失 | CA 兜底增加 `~/Library/Application Support/*/cert` 多路径扫描 |
