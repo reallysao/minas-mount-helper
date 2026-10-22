@@ -203,8 +203,19 @@ def _resolve_tls(t: TlsTarget) -> TlsConfig:
     """env(MWDAV_TLS_*) 优先；其次发布配置；再用受信本地证书目录兜底。
     server_name 只能来自 env/显式配置，缺失由 build_client_context fail-closed。"""
     env = lambda n: os.environ.get(n) or None
-    ca = env("MWDAV_TLS_CA_FILE") or t.ca_file or os.path.join(CERTS, "ca_chain.pem")
-    ca = ca if os.path.isfile(ca) else None
+    ca = env("MWDAV_TLS_CA_FILE") or t.ca_file
+    if ca is None or not os.path.isfile(ca):
+        # 多路径兜底：标准 App 安装目录 + 用户支持目录（兼容非标准安装）
+        _cand = [os.path.join(CERTS, "ca_chain.pem")]
+        try:
+            _base = os.path.expanduser("~/Library/Application Support")
+            for _d in os.listdir(_base):
+                _p = os.path.join(_base, _d, "cert", "ca_chain.pem")
+                if os.path.isfile(_p):
+                    _cand.append(_p)
+        except Exception:
+            pass
+        ca = next((_p for _p in _cand if os.path.isfile(_p)), None)
     cert = env("MWDAV_TLS_CERT_FILE") or t.cert_file
     key = env("MWDAV_TLS_KEY_FILE") or t.key_file
     if not (cert and key):
