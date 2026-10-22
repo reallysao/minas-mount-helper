@@ -174,3 +174,10 @@ MIT License
 | 问题 | 根因 | 修复 |
 |---|---|---|
 | 下载安装后双击无反应、图形界面不出现 | 启动器要求系统存在 Python 3.10+；多数 Mac 只有系统 3.9，且旧启动器在找不到时静默用 3.9 运行导致直接崩溃 | **应用内置 Python 运行时**（PyInstaller 打包，含 tkinter/ssl/netfs_mount 调用链），双击即用、零依赖；Intel/Apple Silicon 双架构通用（netfs_mount 为 universal binary） |
+
+## 致谢
+
+感谢以下朋友对本项目的帮助：
+
+- **MilkChan01**（[@MilkChan01](https://github.com/MilkChan01)）—— 提交 PR #2：修复端口选择回归、补充文档契约与静态审计、构建并验证 Universal 版 netfs_mount 等多项改进
+- **🍀浮生戚戚** —— 测试与反馈支持
