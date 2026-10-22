@@ -40,8 +40,7 @@
 
 - macOS 11.0+
 - 已安装并登录官方「小米智能存储」App（必须，隧道依赖它）
-- Python 3.10+：macOS 系统自带 python3 为 3.9，不满足；请用 Homebrew 安装：
-  `brew install python@3.11`（启动器会自动查找 Homebrew/系统里可用的 3.10+ 解释器）
+- **无需安装任何依赖**：应用内置 Python 运行时（PyInstaller 打包），Intel 与 Apple Silicon 通用
 
 ## 安装
 
@@ -169,3 +168,9 @@ MIT License
 | 需手工配置 `tls_server_name`（设备 ID），换设备/换账号即失效 | 严格 TLS 要求显式服务器名，但设备 ID 因设备而异且官方 App 不提供配置入口 | 新增 `discover_server_name`：本地回环身份探测自动读取隧道证书 subject CN（`nas.*`）；未配置时自动获取，无需任何手工配置；仍保持 CERT_REQUIRED fail-closed |
 | 启动器依赖豆包沙箱 Python 路径，其他 Mac 无法运行 | launcher 优先查找 `~/Library/Application Support/Doubao/sandbox_runtime/...`（本机专属） | 重写启动器：Homebrew（Intel/Apple Silicon）→ PATH → 系统 查找链；GUI 单实例匹配精确化（不再误拦常驻服务） |
 | 代理 CA 兜底路径仅认标准安装位置 | 小米 App 若装在非标准位置则 CA 缺失 | CA 兜底增加 `~/Library/Application Support/*/cert` 多路径扫描 |
+
+## 修复记录（2026-10-22，v1.6b：内置运行时修复"无法打开"）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| 下载安装后双击无反应、图形界面不出现 | 启动器要求系统存在 Python 3.10+；多数 Mac 只有系统 3.9，且旧启动器在找不到时静默用 3.9 运行导致直接崩溃 | **应用内置 Python 运行时**（PyInstaller 打包，含 tkinter/ssl/netfs_mount 调用链），双击即用、零依赖；Intel/Apple Silicon 双架构通用（netfs_mount 为 universal binary） |
