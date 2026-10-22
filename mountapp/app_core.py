@@ -91,7 +91,12 @@ def parse_mount_table(lines, host=PROXY_HOST, port=PROXY_PORT):
         src, rest = line.split(" on ", 1)
         m = re.match(r"\s*(\S+?)\s+\((.*)\)\s*$", rest.strip())
         mp = m.group(1) if m else rest.split()[0]
-        netloc = src[2:] if src.startswith("//") else src
+        netloc = src
+        if "://" in netloc:
+            # WebDAV/FTP 风格 URL 源：http://host:port/path
+            netloc = netloc.split("://", 1)[1].split("/", 1)[0]
+        elif netloc.startswith("//"):
+            netloc = netloc[2:]
         if "@" in netloc:
             netloc = netloc.split("@", 1)[1]
         h, _, p = netloc.partition(":")
