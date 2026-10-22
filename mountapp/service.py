@@ -376,6 +376,13 @@ class ResidentService:
                 view = self.discovery.refresh(force=False)
                 self._view = view
                 if view.connected and view.webdav_port:
+                    if (self.tls is not None and not self.tls.server_name
+                            and view.webdav_port):
+                        import conn_manager as _cm
+                        cn = _cm.discover_server_name(view.webdav_port)
+                        if cn:
+                            self.tls = dataclasses.replace(
+                                self.tls, server_name=cn)
                     self._start_proxy()
                     self._publish(view)
                 self._mount_health(view)
