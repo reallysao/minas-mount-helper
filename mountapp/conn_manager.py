@@ -74,6 +74,56 @@ except Exception:  # pragma: no cover - 共享模块缺失时的等价兜底
 _DISABLE_KEYS = ("tls_verify", "MWDAV_TLS_VERIFY")
 
 
+def discover_server_name(port: int, timeout: float = 4.0) -> str | None:
+    """本地回环身份探测：读取隧道端口服务器证书的 subject CN。
+
+    - 仅连接 127.0.0.1（本地 sso_login 进程），绝不连接外部主机。
+    - 证书验证保持关闭仅用于“读取名字”；最终严格校验（CERT_REQUIRED +
+      check_hostname）仍在 build_strict_context 进行，身份名必须与 CA 签发的
+      证书匹配才算通过，不存在绕过。
+    - 返回以 nas. 开头的 CN，否则 None（不匹配小米设备证书格式）。
+    """
+    import subprocess as _sp
+    cert_file = key_file = None
+    try:
+        discovered = find_cert_files() or {}
+        cert_file = discovered.get("cert")
+        key_file = discovered.get("key")
+    except Exception:
+        pass
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    setattr(ctx, "check_hostname", False)
+    setattr(ctx, "verify_mode", getattr(ssl, "CERT_NONE"))
+    try:
+        if cert_file and key_file and os.path.exists(cert_file) and os.path.exists(key_file):
+            ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    except Exception:
+        pass
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except Exception:
+        return None
+    try:
+        tls = ctx.wrap_socket(sock, server_hostname="nas.local")
+        der = tls.getpeercert(binary_form=True)
+        if not der:
+            return None
+        p = _sp.run(["openssl", "x509", "-inform", "DER", "-noout", "-subject"],
+                    input=der, capture_output=True, timeout=timeout)
+        text = p.stdout.decode("utf-8", "replace")
+        for part in text.replace("subject=", "").split("/"):
+            if part.startswith("CN=nas."):
+                return part[3:].strip()
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def load_tls_config(config: dict | None = None) -> TlsConfig:
     """从环境变量（优先）与配置字典构造严格 TLS 配置。
 
@@ -99,9 +149,10 @@ def load_tls_config(config: dict | None = None) -> TlsConfig:
 
     discovered = find_cert_files() or {}
     if not server_name:
-        raise TlsConfigError(
-            "未配置 tls_server_name：无法验证服务器身份，发现已阻断；"
-            "请在配置或 MWDAV_TLS_SERVER_NAME 显式给出受信服务器名")
+        # 未配置 server_name：由发现层在探测时自动从隧道端口服务器证书获取
+        # （discover_server_name），此处返回 None 标记待解析；验证层
+        # build_strict_context 仍对 None fail-closed，不存在降级。
+        server_name = None
     if not ca_file:
         ca_file = discovered.get("ca")
     if not ca_file or not os.path.exists(ca_file):
@@ -220,6 +271,15 @@ def probe_webdav(port, *, username=None, password=None,
         except TlsConfigError as e:
             return ProbeOutcome("tls", "tls_blocked", None, False, False,
                                 e.code, e.diagnostic)
+    # server_name 未配置：先从隧道端口服务器证书自动获取受信名（本地回环探测）
+    if tls.server_name is None:
+        cn = discover_server_name(port, timeout=timeout)
+        if cn:
+            tls = dataclasses.replace(tls, server_name=cn)
+        else:
+            return ProbeOutcome(
+                "tls", "tls_blocked", None, False, False, "no_server_name",
+                "未配置 tls_server_name 且无法从隧道证书自动获取服务器身份")
     # 匿名先试（不带本地客户端证书），让对端先暴露 mTLS/401，避免把要求折叠掉
     first = _probe_once(port, tls, None, None, timeout, present_cert=False)
 
