@@ -109,6 +109,11 @@ class _ServiceCore:
     def mount(self):
         return self._cmd_c.call("mount")
 
+    def poll_storage(self):
+        """按需拉取一次存储统计（后台常驻轮询已移除）。"""
+        data = self._cmd_c.call("storage") or {}
+        return data.get("storage") or []
+
     def unmount(self):
         return self._cmd_c.call("unmount")
 
@@ -183,6 +188,11 @@ class App(tk.Tk):
         self.storage_bar.pack(fill="x", pady=(8, 4))
         self.storage_text = tk.Label(storage_card, text="—", font=self.font_small, bg=CARD, fg=SUBTEXT)
         self.storage_text.pack(anchor="w")
+        self.storage_refresh_btn = tk.Button(storage_card, text="刷新", font=self.font_small,
+                                             bg="#e5e5ea", fg=TEXT, relief="flat", bd=0, padx=10, pady=3,
+                                             activebackground="#d1d1d6", activeforeground=TEXT,
+                                             command=self._refresh_storage)
+        self.storage_refresh_btn.pack(anchor="w", pady=(6, 0))
 
         # 连接卡片
         conn_card = tk.Frame(container, bg=CARD, padx=14, pady=12)
@@ -248,6 +258,22 @@ class App(tk.Tk):
             self.auto_mount_var.set(self.core.config.get("auto_mount", True))
             self.auto_start_var.set(self.core.config.get("auto_start", False))
 
+    def _refresh_storage(self):
+        """按需读取一次存储统计；慢探测放后台线程，不冻结界面。"""
+        self.storage_refresh_btn.config(state="disabled")
+        self.storage_text.config(text="正在读取…")
+
+        def work():
+            try:
+                self.core.poll_storage()
+            except Exception as e:
+                msg = f"读取失败：{e}"
+                self.after(0, lambda: self.storage_text.config(text=msg))
+            finally:
+                self.after(0, self.refresh)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _mount(self):
         self._run_async(lambda: self.core.mount())
 
@@ -308,7 +334,8 @@ class App(tk.Tk):
             self.storage_text.config(text=f"已用 {human_size(used)} / 共 {human_size(total)}（{pct:.1f}%）")
         else:
             self.storage_bar["value"] = 0
-            self.storage_text.config(text="存储信息获取失败（不影响挂载）")
+            self.storage_text.config(text="点「刷新」获取（不影响挂载）")
+            self.storage_refresh_btn.config(state="normal")
 
         # 挂载状态
         mounted = self.core.is_mounted()
@@ -373,7 +400,16 @@ def _connect_soft(client):
 def main():
     if "--service" in sys.argv:
         from service import ResidentService
-        raise SystemExit(ResidentService().serve())
+        import json as _json
+        _cfg = {}
+        try:
+            with open(os.path.expanduser(
+                    "~/Library/Application Support/小米智能存储挂载助手/config.json"),
+                    encoding="utf-8") as _f:
+                _cfg = _json.load(_f)
+        except Exception:
+            pass
+        raise SystemExit(ResidentService(_cfg).serve())
     socket_path = _ensure_service_socket_path()
     from client import IpcClient
     # 复用探针已确认的 socket；两条连接初始失败均受控降级，不致 startup traceback。

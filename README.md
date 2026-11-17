@@ -10,7 +10,8 @@
 - ✅ 隧道端口动态变化时自动跟随
 - ✅ 断线自动重连、死挂载自动清理
 - ✅ 登录时自动启动、连接后自动挂载
-- ✅ 存储空间用量实时显示
+- ✅ 存储空间用量按需刷新（点「刷新」拉取一次，不后台轮询）
+- ✅ 挂载改用系统 `mount_webdav`，不再触发「不安全的连接」认证弹窗
 - ✅ 大目录性能优化（连接复用、元数据快速响应、PROPFIND 缓存）
 
 > 说明：`mountapp/sync_engine.py`（同步模块）当前**未被主程序加载**，本版本入口不提供同步面板，
@@ -26,7 +27,7 @@
               （自动注入凭证，全方法透传 DAV 1,2）
                           │
                           ▼
-              Finder NetFS 原生挂载 → /Volumes/127.0.0.1
+              Finder 原生挂载 → ~/Volumes/127.0.0.1
 ```
 
 - 复用官方 App 已建立的 P2P 隧道（`sso_login` 进程）
@@ -52,13 +53,15 @@
 
 ```bash
 git clone https://github.com/reallysao/minas-mount-helper.git
-cd minas-mount-helper/mountapp
+cd minas-mount-helper
 
-# 编译 netfs_mount（需要 Xcode Command Line Tools）
-clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
-
-# 构建 app bundle（参考 使用说明.md）
+# 需要 Python 3.10+ 与 PyInstaller（仅构建用到，运行不需要）
+python3 -m pip install pyinstaller
+./build_app.sh
 ```
+
+产物在 `build/小米智能存储挂载助手.app`。PyInstaller 不能跨架构编译：在 Intel 机器上得到 x86_64 包，
+在 Apple Silicon 机器上得到 arm64 包。
 
 ## 使用
 
@@ -68,6 +71,19 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 4. Finder 侧边栏出现 `127.0.0.1`，即可像本地磁盘一样使用
 
 > 首次打开如被 Gatekeeper 拦截：右键应用 → 打开 → 再点「打开」。
+
+> 挂载点在 `~/Volumes/127.0.0.1`（个人目录下），不是系统 `/Volumes`。想让它像外接硬盘那样出现在 Finder「位置」里，可执行一次：
+> ```bash
+> sudo mkdir -p /Volumes/127.0.0.1 && sudo chown "$USER":staff /Volumes/127.0.0.1
+> ```
+
+## 加入交流群
+
+有问题、想反馈 bug 或交流使用心得，直接用**小红书扫码进群**：
+
+<img src="docs/images/xiaohongshu-group.jpg" width="320" alt="小红书群聊二维码">
+
+> 该二维码 28 天内有效（至 2026-12-15）。若已过期，请在 [Issues](https://github.com/reallysao/minas-mount-helper/issues) 留言。
 
 ## 安全说明
 
@@ -89,8 +105,12 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 
 - 代理只监听 `127.0.0.1`（本机回环），不对外开端口；但**回环不等于信任**，
   绑定回环本身不能隔离同机其他用户/进程。
-- 入站恒为 require/fail-closed（代码已落地，A 层契约覆盖）：缺/错凭证 401、目标未配齐 503，
-  绝不匿名转发（SR-1）；NetFS 是否携带凭证属 B-7 实机兼容项，失败记兼容性问题，不以匿名绕过。
+- 入站认证策略（2026-11-17 调整，为消除 macOS NetFS 认证弹窗）：
+  - **带 `Authorization` 但校验不通过** → 401；目标未配齐 → 503；
+  - **完全不带凭证** → 视为本机回环访问直接放行。原因：macOS NetFS 收到任何 `401 + WWW-Authenticate`
+    挑战就会拉起 NetAuthAgent 弹「需要认证」，配合同步阻塞式挂载会造成「点完一个还有一个」的弹窗风暴；
+  - 代价：同机其他进程可经该回环代理匿名访问 NAS。需要严格隔离时，请不要常驻运行本服务，
+    或改用显式账号直连 WebDAV 自行挂载。
 - 含密码的状态文件目标权限 600、目录 700；官方 App 客户端私钥应收紧为 600。
 
 ### 在公司电脑上使用
@@ -98,7 +118,7 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 | 威胁场景 | 状态 |
 |---|---|
 | 公司局域网其他电脑扫描/访问 | ✅ 代理只监听回环，外部无法直连 |
-| 同机其他用户账户/进程 | ⚠️ 入站恒认证已落地（A 层覆盖），NetFS 兼容与隔离效果属 B-7 实机项，未验前不宣称"完全不可访问" |
+| 同机其他用户账户/进程 | ⚠️ 回环代理对匿名请求放行（为消除认证弹窗），同机进程可经代理访问 NAS；需要隔离时请勿常驻运行 |
 | 同事使用你已解锁的电脑 | ⚠️ 可访问，离开前务必锁屏（⌃⌘Q） |
 | 公司 IT 管理员（MDM/管理员权限） | ⚠️ 理论上可读，管理员本就可访问该电脑一切内容 |
 
@@ -110,8 +130,8 @@ clang -framework Foundation -framework NetFS -o netfs_mount netfs_mount.m
 - **下载响应体上限 64MiB**：`MAX_RESPONSE_BODY` 硬限，上游响应超限即中止并 `507`、关闭上游连接；
   v1 不做流式 spool/背压，超大文件下载明确失败而非静默截断。
 - **拒绝 chunked 写方法**：`Transfer-Encoding: chunked` 的写请求返回 `501`（v1 不做流式解码）。
-- **挂载助手已按 v2 stdin 协议受控重建**：macOS CI 使用 Apple SDK 编译 arm64+x86_64 Universal Mach-O，
-  校验 0755 与 `MWDAV_MOUNT_PROTOCOL=2`；凭证走 stdin、不进 argv。真实 Finder/NAS 挂载仍需 B 层实机验证。
+- **挂载后端改用系统 `mount_webdav`**（2026-11-17）：不再经 `netfs_mount` 的 `NetFSMountURLSync`，
+  避免同步阻塞式确认框；卸载改用 `diskutil unmount force`。`netfs_mount` 源码与二进制仍保留，主流程不再调用。
 - **TLS 受信身份必须显式配置**：`tls_server_name` 必填（同时用于 SNI 与主机名校验），
   `MWDAV_TLS_SERVER_NAME/CA_FILE/CERT_FILE/KEY_FILE` 环境变量优先；**无 `tls_verify=false`/`MWDAV_TLS_VERIFY` 跳过开关**，
   缺失受信配置 fail-closed，不从对端证书或连接池自动学习身份。
@@ -140,10 +160,12 @@ minas-mount-helper/
 ├── README.md                 # 本文件
 ├── 使用说明.md                # 详细使用说明与修复记录
 ├── AGENTS.md / CONTRIBUTING.md  # 协作须知与贡献流程
-├── docs/                     # SDD 规格/设计/验收/矩阵/威胁模型
+├── build_app.sh              # 一键构建内置运行时的 .app
+├── docs/                     # SDD 规格/设计/验收/矩阵/威胁模型 + 文档配图
 │   ├── sdd/                  # requirements / architecture / acceptance / process / matrix
 │   ├── specs/                # proxy.md（数据面）、runtime.md（控制面）
-│   └── security/             # 威胁模型
+│   ├── security/             # 威胁模型
+│   └── images/               # 文档配图（含交流群二维码）
 ├── tests/                    # 离线自动化（run_tests.py 入口；CI 只跑这里）
 ├── .github/workflows/        # CI（仅离线脚本）
 ├── mountapp/                 # 核心源码
@@ -174,6 +196,15 @@ MIT License
 | 问题 | 根因 | 修复 |
 |---|---|---|
 | 下载安装后双击无反应、图形界面不出现 | 启动器要求系统存在 Python 3.10+；多数 Mac 只有系统 3.9，且旧启动器在找不到时静默用 3.9 运行导致直接崩溃 | **应用内置 Python 运行时**（PyInstaller 打包，含 tkinter/ssl/netfs_mount 调用链），双击即用、零依赖；Intel/Apple Silicon 双架构通用（netfs_mount 为 universal binary） |
+
+## 修复记录（2026-11-17：认证弹窗风暴、存储信息空转）
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| 弹出大量「不安全的连接 / 需要认证」对话框，点完一个还有一个，电脑卡顿 | 代理对所有未认证请求（含 `OPTIONS` 与无凭证 `PROPFIND`）返回 `401 + WWW-Authenticate`，macOS NetFS 收到挑战即拉起 NetAuthAgent；`netfs_mount` 的同步挂载被该框阻塞 40s；自愈循环卸完立刻重挂，无冷却无上限，每次重挂再弹一次 | `OPTIONS` 免认证返回 `200`；本机回环的匿名请求放行（带凭证仍校验，失败 401）；挂载改用 `mount_webdav`、卸载用 `diskutil unmount force`；重挂加指数退避（30s→300s）与连续 3 次失败熔断 |
+| 存储空间长期显示「获取失败」 | 后台每 60s 轮询、实际每 5 分钟向 NAS 侧逐端口做 TLS 探测，接口/端口变化即失败，失败后继续空转；探测单端口最多 5s 超时 | 移除后台轮询，改为 IPC `storage` 按需拉取（UI 点「刷新」才请求一次）；取不到时显示「点刷新获取」，不再报错 |
+| 挂载点在 `/Volumes` 下创建失败 | `/Volumes` 属 root，普通进程 `mkdir` 报 Permission denied | 默认挂载点改为 `~/Volumes/127.0.0.1` |
+| 启动器依赖本机私有 Python 路径，别人下载后无法运行 | 修复期为了让热更新生效，临时硬编码了某台机器沙箱内的 Python 3.14 | 全部逻辑改为走内置 `mwdav_runtime`（PyInstaller 打包、自带解释器），源码不再出现任何本机路径 |
 
 ## 致谢
 

@@ -21,10 +21,11 @@ import conn_manager as cm
 import app_core as ac
 from ipc import READONLY_CMDS
 
+
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 18445
 MOUNT_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/"
-DEFAULT_MOUNT_POINT = "/Volumes/127.0.0.1"
+DEFAULT_MOUNT_POINT = os.path.expanduser("~/Volumes/127.0.0.1")
 WEBDAV_BASE = "/pool0/data"
 DEFAULT_INTERVAL = 20.0
 
@@ -80,8 +81,8 @@ class ConnDiscovery:
             storage=st.get("storage") or [],
             error=st.get("error") or "")
 
-    def poll_storage(self) -> list:
-        st = self.conn.poll_storage()
+    def poll_storage(self, force=False) -> list:
+        st = self.conn.poll_storage(force=force)
         return st.get("storage") or []
 
 
@@ -178,6 +179,14 @@ class ResidentService:
         self._user_unmounted = False
         self._dead_streak = 0
         self._stale_streak = 0
+        # 重挂退避/熔断状态：连续"挂载后又判定不健康"原本会立刻 unmount→mount
+        # 无限循环，而每次 NetFS 挂载都会触发系统认证/不安全提示框，
+        # 造成弹窗风暴与主循环阻塞。以下状态用于冷却、退避与熔断。
+        self._remount_failures = 0
+        self._next_remount_at = 0.0
+        self._was_connected = False
+        self._last_alive_check = 0.0
+        self._last_alive = True
 
         self._stop = threading.Event()
         self._loop_thread = None
@@ -323,6 +332,15 @@ class ResidentService:
         return True
 
     # ---------- 挂载协调 / 自愈 ----------
+    # 重挂熔断参数：失败一次后冷却 30s，连续失败按 2 倍退避（上限 300s）；
+    # 连续 3 次"挂上又坏"则暂停自动重挂，等设备重新上线或用户手动挂载。
+    REMOUNT_BASE_COOLDOWN = 30.0
+    REMOUNT_MAX_FAILURES = 3
+    ALIVE_PROBE_INTERVAL = 60.0
+
+    def _auto_remount_allowed(self) -> bool:
+        return time.monotonic() >= self._next_remount_at
+
     def _expected_mountpoint(self):
         return self.config.get("mount_dir") or DEFAULT_MOUNT_POINT
 
@@ -332,6 +350,14 @@ class ResidentService:
         self._mount_path = mp
 
     def _mount_health(self, view: DiscoveryView):
+        # 设备从"掉线"恢复为"在线"时重置熔断，允许重新自动挂载一次。
+        if view.connected and not self._was_connected:
+            self._remount_failures = 0
+            self._next_remount_at = 0.0
+            self._stale_streak = 0
+            self._dead_streak = 0
+        self._was_connected = view.connected
+
         self._refresh_mount_state()
         if not view.connected:
             self._stale_streak = 0
@@ -347,27 +373,47 @@ class ResidentService:
             return
         if not self._mounted:
             self._stale_streak = 0
-            if (self.config.get("auto_mount", True) and not self._user_unmounted
+            if not (self.config.get("auto_mount", True) and not self._user_unmounted
                     and view.webdav_port and view.username and view.password):
-                self.mount.mount(MOUNT_URL, self._expected_mountpoint(),
-                                  view.username, view.password)
-                self._refresh_mount_state()
+                return
+            if not self._auto_remount_allowed():
+                # 熔断冷却中：保持未挂载，避免再次触发系统认证弹窗。
+                return
+            self.mount.mount(MOUNT_URL, self._expected_mountpoint(),
+                              view.username, view.password)
+            self._refresh_mount_state()
             return
-        alive = getattr(self.mount, "alive", lambda _expected: True)(
-            self._expected_mountpoint())
-        if not alive:
-            self._stale_streak += 1
-            if self._stale_streak >= 2:
-                self.mount.unmount(self._expected_mountpoint())
-                self._refresh_mount_state()
-                if (self.config.get("auto_mount", True) and not self._user_unmounted
-                        and view.webdav_port and view.username and view.password):
-                    self.mount.mount(MOUNT_URL, self._expected_mountpoint(),
-                                      view.username, view.password)
-                    self._refresh_mount_state()
-                self._stale_streak = 0
-        else:
+
+        # 存活探测降频：网络卷的 ls/PROPFIND 在 NAS 抖动时会长时间阻塞，
+        # 每个 tick 都探测会拖慢主循环并放大误判。
+        now = time.monotonic()
+        if now - self._last_alive_check >= self.ALIVE_PROBE_INTERVAL:
+            self._last_alive = bool(
+                getattr(self.mount, "alive", lambda _expected: True)(
+                    self._expected_mountpoint()))
+            self._last_alive_check = now
+        if self._last_alive:
             self._stale_streak = 0
+            self._remount_failures = 0
+            self._next_remount_at = 0.0
+            return
+
+        self._stale_streak += 1
+        if self._stale_streak < 2:
+            return
+        # 连续两轮判定不健康：先卸载，再进入退避；绝不在同一轮立即重挂。
+        self.mount.unmount(self._expected_mountpoint())
+        self._refresh_mount_state()
+        self._stale_streak = 0
+        self._last_alive = True
+        self._last_alive_check = time.monotonic()
+        self._remount_failures += 1
+        if self._remount_failures >= self.REMOUNT_MAX_FAILURES:
+            self._next_remount_at = float("inf")
+        else:
+            cooldown = self.REMOUNT_BASE_COOLDOWN * (
+                2 ** (self._remount_failures - 1))
+            self._next_remount_at = time.monotonic() + min(cooldown, 300.0)
 
     # ---------- 后台循环 ----------
     def _loop(self):
@@ -412,8 +458,9 @@ class ResidentService:
             self._stop.clear()
             self._loop_thread = threading.Thread(target=self._loop, daemon=True)
             self._loop_thread.start()
-            self._storage_thread = threading.Thread(target=self._storage_loop, daemon=True)
-            self._storage_thread.start()
+            # 存储统计改为按需（IPC "storage"）拉取，不再常驻轮询：
+            # 该路径要逐个隧道端口建 TLS 连接，失败时每条最多 5s 超时，
+            # 常驻线程只会在取不到数据时反复空转。
         except Exception:
             if self._ipc is not None:
                 try:
@@ -487,6 +534,7 @@ class ResidentService:
             "unmount": self._cmd_unmount,
             "open_finder": self._cmd_open_finder,
             "refresh": self._cmd_refresh,
+            "storage": self._cmd_storage,
             "set_config": self._cmd_set_config,
             "stop": self._cmd_stop,
         }.get(cmd)
@@ -500,6 +548,17 @@ class ResidentService:
 
     def _cmd_status(self, args):
         return self.status_view()
+
+    def _cmd_storage(self, args):
+        """按需拉取一次存储统计（仅在用户点击刷新时调用，后台不再轮询）。
+
+        该探测要逐个隧道端口建 TLS 连接，失败时每条最多 5s 超时；常驻轮询
+        既没有稳定收益又会空转，改为用户触发的一次性请求。
+        """
+        storage = self.discovery.poll_storage(force=True)
+        if storage:
+            self._view = dataclasses.replace(self._view, storage=storage)
+        return {"storage": storage}
 
     def _cmd_get_config(self, args):
         return self.config_view()
@@ -520,6 +579,12 @@ class ResidentService:
             raise ValueError(msg or "挂载失败")
         self._user_unmounted = False
         self._refresh_mount_state()
+        # 手动挂载视为用户明确意图，重置熔断状态
+        self._remount_failures = 0
+        self._next_remount_at = 0.0
+        self._stale_streak = 0
+        self._last_alive = True
+        self._last_alive_check = time.monotonic()
         return {"mounted": self._mounted, "mount_path": self._mount_path}
 
     def _cmd_unmount(self, args):

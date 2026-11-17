@@ -17,7 +17,7 @@ MAX_LINE = 64 * 1024
 
 # 只读命令：不持全局/写锁，避免被慢写命令（如 NetFS 挂载）阻塞；
 # 写命令仍在全局锁内串行执行，杜绝交错写/并发 CAS。
-READONLY_CMDS = frozenset({"status", "get_config"})
+READONLY_CMDS = frozenset({"status", "get_config", "storage"})
 
 
 class IpcProtocolError(Exception):

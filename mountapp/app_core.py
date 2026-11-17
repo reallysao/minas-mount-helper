@@ -29,7 +29,9 @@ NETFS_MOUNT = os.path.join(BASE_DIR, "netfs_mount")
 PROXY_PORT = 18445
 PROXY_HOST = "127.0.0.1"
 MOUNT_URL = f"http://{PROXY_HOST}:{PROXY_PORT}/"
-DEFAULT_MOUNT_POINT = "/Volumes/127.0.0.1"
+# 挂载点选在用户可写目录：/Volumes 由 root 拥有，普通进程无法在其中创建
+# 目录，会导致系统 mount_webdav 因挂载点不存在而失败。
+DEFAULT_MOUNT_POINT = os.path.expanduser("~/Volumes/127.0.0.1")
 
 # NetFS helper 能力版本标记（与 netfs_mount.m --protocol 对齐）；旧二进制无标记一律拒绝。
 PROTOCOL_MARKER = "MWDAV_MOUNT_PROTOCOL=2"
@@ -297,14 +299,17 @@ class AppCore:
     def _helper_supported(self):
         return PROTOCOL_MARKER in self._helper_protocol()
 
-    # ---------- 挂载（凭证走 stdin，不进 argv） ----------
+    # ---------- 挂载（系统 mount_webdav） ----------
     def mount_with_credentials(self, url, mountpoint, username, password):
-        """用调用方已确认的目标执行 NetFS 挂载。
+        """用系统 /sbin/mount_webdav 挂载本地回环 WebDAV 代理。
 
-        常驻服务是发现状态的唯一所有者，因此生产 MountBackend 必须把服务当前
-        DiscoveryView 中的凭证显式传入，不能再从一个新建 AppCore 的空 ConnManager
-        快照取值。默认 /Volumes/127.0.0.1 由 NetFS 自行选择，不作为显式 mountpoint
-        传入，以保持 Finder 可浏览行为；自定义 /Volumes 路径才传给 helper。
+        历史实现走 App 自带的 netfs_mount（内部为 NetFSMountURLSync）。该 API
+        在 http:// 回环地址上会拉起 NetAuthAgent 的「不安全的连接 / 需要认证」
+        确认框并同步阻塞调用，超时后被自动重挂再次拉起，形成弹窗风暴与卡顿。
+        /sbin/mount_webdav 是系统命令行入口，不触发该确认框；本地代理已对
+        匿名请求放行并对错误凭证返回 401，因此改由系统命令挂载。
+
+        凭证参数继续保留用于目标就绪校验；真正连上游用的凭证由代理进程注入。
         """
         if not (url and username and password):
             self.status_text = "无法挂载：连接或凭证不可用"
@@ -312,51 +317,31 @@ class AppCore:
         if self.is_mounted():
             self.status_text = "已挂载"
             return True, "已挂载"
-        if not self._helper_supported():
-            self.status_text = "挂载组件版本过旧：请在 macOS 重新编译 netfs_mount"
-            return False, "helper 协议过旧，需重新编译"
 
-        requested = mountpoint or ""
-        explicit = "" if os.path.normpath(requested or DEFAULT_MOUNT_POINT) \
-            == os.path.normpath(DEFAULT_MOUNT_POINT) else requested
-        args = [NETFS_MOUNT, "mount", url]
-        if explicit:
-            args.append(explicit)
+        target = mountpoint or DEFAULT_MOUNT_POINT
         try:
-            proc = subprocess.Popen(
-                args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
-            out, err = proc.communicate(
-                input=f"{username}\n{password}\n".encode(), timeout=40)
-            text = (out or b"").decode("utf-8", "replace") + \
-                (err or b"").decode("utf-8", "replace")
+            os.makedirs(target, mode=0o755, exist_ok=True)
+        except OSError as e:
+            self.status_text = f"挂载失败: 无法创建挂载点 {e}"
+            return False, f"无法创建挂载点: {e}"
+
+        try:
+            proc = subprocess.run(["/sbin/mount_webdav", url, target],
+                                  capture_output=True, text=True, timeout=30)
+            text = (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired:
-            # communicate 超时不会自动终止子进程；必须 kill 后再次 communicate 以回收，
-            # 避免 helper 在后台继续执行一次迟到的挂载。
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.communicate()
-            except Exception:
-                pass
-            self.status_text = "挂载失败: netfs_mount 超时，已终止并回收"
-            return False, "挂载超时，helper 已终止"
+            self.status_text = "挂载失败: mount_webdav 超时"
+            return False, "挂载超时，已终止"
         except Exception as e:
             self.status_text = f"挂载失败: {e}"
             return False, str(e)
 
-        if "MOUNT_OK" in text:
+        # mount_webdav 成功时返回码为 0；也兼容「已挂载」的幂等情况。
+        if self.is_mounted():
             self._user_unmounted = False
             self.mounted = True
             self.status_text = "挂载成功"
             return True, "挂载成功"
-        if "MOUNT_FAIL" in text and any(x in text for x in ("err=16", "err=17")):
-            if self.is_mounted():
-                self._user_unmounted = False
-                self.status_text = "已挂载（复用现有挂载）"
-                return True, "已挂载"
         self.status_text = f"挂载失败: {text.strip()[:100]}"
         return False, text.strip()[:200]
 
@@ -382,12 +367,13 @@ class AppCore:
             return True, "未挂载"
         p = entry["mountpoint"]
         try:
-            r = subprocess.run([NETFS_MOUNT, "unmount", p],
+            # 系统卸载：diskutil 对无响应的 WebDAV 卷比裸 umount 更可靠
+            r = subprocess.run(["/usr/sbin/diskutil", "unmount", "force", p],
                                capture_output=True, text=True, timeout=30)
             out = (r.stdout or "") + (r.stderr or "")
         except Exception as e:
             return False, str(e)
-        ok = "UNMOUNT_OK" in out
+        ok = r.returncode == 0 or not self._own_mount_entry()
         if ok:
             self.mounted = False
             self.mount_path = None
@@ -522,8 +508,7 @@ class AppCore:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        self._storage_thread = threading.Thread(target=self._storage_loop, daemon=True)
-        self._storage_thread.start()
+        # 存储统计改为按需拉取（IPC "storage"），不在此常驻轮询。
 
     def stop(self):
         self._stop.set()

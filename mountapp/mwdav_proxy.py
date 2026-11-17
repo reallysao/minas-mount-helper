@@ -565,7 +565,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_simple(503, "代理目标尚未配置：等待上游 WebDAV 目标发布。".encode(),
                               close=True)
             return False
-        if not self._authorized():
+        auth_hdr = self.headers.get("Authorization", "")
+        if auth_hdr and not self._authorized():
             self._send_simple(401, b"Unauthorized",
                               extra_headers={"WWW-Authenticate": 'Basic realm="MiNAS"'},
                               close=True)
@@ -602,8 +603,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               close=True)
             return
 
-        # 3. 入站认证：缺失/不匹配 → 401 挑战
-        if not self._authorized():
+        # 3. OPTIONS 能力探测免认证：NetFS 挂载前的 OPTIONS 若按普通请求返回
+        #    401 挑战，macOS 会弹出「不安全的连接 / 需要认证」对话框，并在
+        #    挂载失败时反复重试造成弹窗风暴。OPTIONS 不涉及任何读写数据，
+        #    直接返回能力集即可。
+        if self.command == "OPTIONS":
+            self._send_simple(
+                200, b"",
+                extra_headers={
+                    "DAV": "1, 2",
+                    "MS-Author-Via": "DAV",
+                    "Allow": ("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, "
+                              "PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"),
+                })
+            return
+
+        # 4. 入站认证策略：
+        #    - 带了凭证但校验不通过 → 401（避免错误凭证被静默接受）
+        #    - 完全不带凭证 → 视为本机回环访问直接放行：
+        #      代理只监听 127.0.0.1，上游真实凭证由代理自身注入；而 macOS
+        #      NetFS 挂载进程探测时并不携带凭证，若此处返回 401 就会拉起
+        #      NetAuthAgent 弹「不安全的连接」认证框并阻塞挂载，重试时形成
+        #      弹窗风暴。因此匿名请求放行，只在凭证错误时拒绝。
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header and not self._authorized():
             self._send_simple(
                 401, b"Unauthorized",
                 extra_headers={"WWW-Authenticate": 'Basic realm="MiNAS"'},
